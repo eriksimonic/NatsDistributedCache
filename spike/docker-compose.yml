@@ -1,0 +1,42 @@
+# Milestone-1 spike rig: 3-node NATS JetStream cluster, file storage on named volumes,
+# 0.5 CPU per node with a 10 ms CFS period (design section 9, scaled rig).
+# NATS_IMAGE switches between the pinned version and the documented minimum:
+#   NATS_IMAGE=nats:2.11.2-alpine docker compose -p spike-min up -d
+
+x-nats: &nats
+  image: ${NATS_IMAGE:-nats:2.12.15-alpine}
+  command: ["-c", "/etc/nats/nats.conf"]
+  volumes:
+    - ./nats.conf:/etc/nats/nats.conf:ro
+  cpu_period: 10000
+  cpu_quota: 5000
+  mem_limit: 1g
+  restart: unless-stopped
+
+services:
+  nats-1:
+    <<: *nats
+    environment: { SERVER_NAME: nats-1 }
+    volumes:
+      - ./nats.conf:/etc/nats/nats.conf:ro
+      - nats-1-data:/data
+    ports: ["4222:4222", "8222:8222"]
+  nats-2:
+    <<: *nats
+    environment: { SERVER_NAME: nats-2 }
+    volumes:
+      - ./nats.conf:/etc/nats/nats.conf:ro
+      - nats-2-data:/data
+    ports: ["4223:4222", "8223:8222"]
+  nats-3:
+    <<: *nats
+    environment: { SERVER_NAME: nats-3 }
+    volumes:
+      - ./nats.conf:/etc/nats/nats.conf:ro
+      - nats-3-data:/data
+    ports: ["4224:4222", "8224:8222"]
+
+volumes:
+  nats-1-data:
+  nats-2-data:
+  nats-3-data:
