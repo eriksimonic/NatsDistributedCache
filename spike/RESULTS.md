@@ -1,45 +1,50 @@
 # Milestone-1 spike results
 
-Sep 30, 2026. Rig: 3-node NATS cluster in docker compose, file storage on named volumes, R3, 0.5 CPU per node (`cpu_period` 10 ms, `cpu_quota` 5 ms), 1 GB each, `sync_interval: 2m`. Client: NATS.Net 3.3.0 on .NET 10, running on the host (loopback, so latencies are a lower bound). Buckets: History 1, `LimitMarkerTTL` 2 s (short, to keep the tests fast).
+Sep 30, 2026. Rig: 3-node NATS cluster in docker compose, file storage on named volumes, R3, 0.5 CPU per node (`cpu_period` 10 ms, `cpu_quota` 5 ms), 1 GB each, `sync_interval: 2m`. Client: NATS.Net 3.3.0 on .NET 10 on the host (loopback, so latencies are a lower bound), `RequestTimeout` 2 s. Buckets: History 1, `LimitMarkerTTL` 2 s (short, to keep the tests fast).
 
-Run it with `./run-spike.sh [image]` (default: `nats:2.15.0-alpine`, the latest stable release and, from design v1.2, the only supported version). Raw results land in `results/` (not committed). Final runs: 2.12.15 and 2.14.7, all tests pass; `lock-throughput-kv` is kept as evidence and is expected to fail. 2.11.2 was run once and is no longer supported (finding 1).
+Run it with `./run-spike.sh [image]`. The default is `nats:2.15.0-alpine`, the latest stable release and, from design v1.2, the only supported version. The script refuses release-candidate images, checks the server version via `/varz`, clears old results for the version, and always tears the stack down. Raw results land in `results/` (not committed).
 
-## NATS 2.15.0 (required version from design v1.2)
+## Current result: NATS 2.15.0, after the review-6 fixes
 
-All checks pass: markers (expiry 3.1 s), CAS on markers, helper DEL, leader read p50 0.54 ms vs Direct Get 0.38 ms, Direct Get 0.2 % stale idle, helper contention (500 acquisitions, max 1 owner, 0 errors, wait p99 239 ms), TTL overwrite and renewals, ordered-consumer silent skip, restart (lock gone after 45.2 s, data survived). Helper lock throughput about 1 690 ops/s (cycle p50 19 ms, p99 40 ms), leader at 49 % of one CPU (its quota). `CreateAsync` still fails 2.8 % on uncontended keys.
+All 14 checks pass. `lock-throughput-kv` fails by design: it is the evidence for finding 2.
 
-## Summary (earlier versions)
+| Check | Result |
+| --- | --- |
+| TTL → `MaxAge` delete marker; marker expires | Expiry after 3.04 s for a 3 s TTL; watch sees `Put@1` then `Purge@2` (asserted); marker gone after the 2 s marker TTL |
+| Fence on markers | Expected 0 on a marker → `10071 wrong last sequence: 4`; expected = marker revision → committed; expected 0 after the marker expired → committed |
+| DEL through the helper | Tombstone revision = PubAck sequence; resending the same msg id → duplicate ack at the same sequence; stale fenced delete → 10071 |
+| Read latency (p50 / p99) | Direct Get 0.41 / 5.3 ms, leader read 0.42 / 5.3 ms |
+| Direct Get staleness | 0.3 % stale right after a write (a lower bound: some reads are answered by the leader); leader read 0 stale |
+| NATS.Net `CreateAsync` race, 5 nodes | 300/300 rounds with one winner (baseline only; the winner releases after the losers finish) |
+| Helper acquire under contention, 5 nodes × 100 | 500 acquisitions, 0 overlapping ownership intervals (checked on server sequences), 0 errors, 0 starved; 724 transient 10164s retried; wait p50 2.2 ms, p99 298 ms |
+| TTL overwrite and renewals | Replacement survives the old 5 s timer; 10 renewals with the lease token keep a 5 s lease alive for 15 s; it expires 5.04 s after the last renewal |
+| Ordered consumer below `FirstSeq` | Silently starts at `FirstSeq` (31) with no error; the stream-sequence gap is detectable |
+| Helper lock throughput, 16 workers, one key each | 835 cycles/s (about 1 670 lock ops/s), cycle p50 19 ms, p99 47 ms, 0 errors; the busiest node (the leader) at 45–46 % of one CPU, i.e. near its 0.5 CPU quota |
+| Leader failover (new): 6 workers, locks stream leader restarted twice | 19 042 cycles, 10 unknown outcomes and 2 duplicate acks all resolved, 0 spurious losses, 0 failed releases, 0 stuck locks; longest cycle 2.3 s (the election); 2 leader reads failed with no-response during an election and were retried by the next cycle |
+| Full cluster restart | Data survived; the 45 s lock expired at 45.0 s |
+| `CreateAsync` on uncontended keys (evidence) | 19.9 % of cycles failed in this run (2.7–5.3 % in earlier runs) |
 
-| Assumption (DESIGN.md) | 2.12.15 | 2.14.7 | 2.11.2 (first run) | Verdict |
-| --- | --- | --- | --- | --- |
-| Per-key TTL writes a `MaxAge` delete marker on expiry; the marker expires after `LimitMarkerTTL` | Pass | Pass | Pass | Holds. Expiry after 3.1 s for a 3 s TTL; watch sees `Put` then `Purge` |
-| Fence: expected 0 fails on a marker (10071), expected = marker revision succeeds, expected 0 succeeds once the marker is gone | Pass | Pass | Pass | Holds as the fence rule assumes |
-| DEL via the publish helper: PubAck sequence = tombstone revision; a stale fenced delete gets 10071 | Pass | Pass | Pass | Holds |
-| Direct Get vs leader read latency (p50 / p99) | 0.39 / 5.7 ms vs 0.36 / 4.6 ms | 0.37 / 2.9 ms vs 0.50 / 4.3 ms | 0.35 / 1.3 ms vs 0.48 / 1.3 ms | Leader read costs at most about +0.15 ms at p50 |
-| Direct Get is not read-after-write coherent | 0.05–0.45 % stale (idle) | 0.2–0.45 % | 0.05 % | Confirmed. Under lock load about 5 % (the `CreateAsync` failures below are that stale read). Leader read: 0 stale |
-| Five nodes racing NATS.Net `Create` on one key | 300/300 one winner | 300/300 | 300/300 | Holds, but the winner released after all losers finished, so this does not test #5162 |
-| Helper acquire under contention: 5 nodes × 100 acquisitions, release racing the losers | 0 errors, max 1 owner, 0 starved | 0 errors, max 1 owner, 0 starved | not run | Holds after two fixes (findings 4 and 5). Acquire wait p50 3–4 ms, p99 200–270 ms |
-| Overwriting a TTL'd message; lease renewals | Pass | Pass | not run | The replacement survives the old 5 s timer; 10 renewals keep a 5 s lease alive for 15 s; it expires 5.1 s after the last renewal |
-| Ordered consumer asked to start below `FirstSeq` | Silently starts at `FirstSeq` | Same | Same | Silent skip confirmed; the sequence-gap check in section 7 is required and works |
-| Full cluster restart: data survives, TTL timers resume | Pass (gone after 45.2 s for 45 s) | Pass (45.2 s) | **Fail**: never expired within TTL + 60 s | Minimum version 2.12.1 (finding 1) |
-| Lock throughput, helper acquire, 16 workers, one key each | about 2 000 lock ops/s, cycle p50 15 ms, p99 39 ms | about 1 730 ops/s, p50 19 ms, p99 42 ms | about 2 760 ops/s, p50 11 ms, p99 22 ms | One closed-loop point, CPU sampled during the helper run: the busiest node (the leader) is at 49 % of one CPU, i.e. its 0.5 CPU quota. Provisional; a worker sweep replaces it before milestone 6 |
+## Findings that changed the design
 
-## Findings that changed the design (v1.1)
-
-1. **Minimum server version is 2.12.1, not 2.11.2.** On 2.11.2 a TTL'd key written before a full cluster restart stayed live for 105 s after its 45 s TTL. The timer is not recovered; this was fixed in 2.11.10 and 2.12.1 (nats-server #7344). A lock held during a restart would never expire. Pin 2.12.15; CI also tests 2.12.1 and the latest 2.14.x.
-2. **NATS.Net `CreateAsync` must not be used for lock acquire.** On keys nobody else touches it failed 3.8–5.3 % of the time on 2.12.15 and 2.14.7 (0.2 % on 2.11.2) with `NatsKVCreateException` or `NatsKVWrongLastRevisionException`. When the subject holds a tombstone it re-reads the entry through Direct Get (NATS.Net 3.3.0 `NatsKVStore` create path), and a lagging replica returns the old live lock or an old revision. The design's publish helper with a leader read replaces it.
-3. **Lock operations saturate 0.5 CPU NATS nodes** at about 1 700–2 000 ops/s (850–1 000 cold-miss cycles/s). K3's budget is derived from this, and it stays provisional.
-4. **Error 10164 is transient and must be retried** (found by the helper tests). On back-to-back writes to one subject (acquire → release), 2.14.7 answers "wrong last sequence" with code 10164 and no sequence: the leader has not applied the previous write yet. Before the fix, one failed release left a live lock that blocked its key for the full LeaseTtl. The helper now retries the identical publish (same expected revision, same `Nats-Msg-Id`) up to 5 times with 2–64 ms backoff; 10071 is never retried blindly.
-5. **An acquire must recognise its own token.** A publish can commit while the client sees an error (lost ack or resend). Without a unique token per acquire, the node saw its own lock as "held by someone" and locked itself out for LeaseTtl: 16 % failed cycles on 2.14.7. With a fresh token and `Nats-Msg-Id` per attempt, and "live token = mine → owned", failures dropped to 0.
+1. **Minimum server version.** On 2.11.2 a TTL'd key written before a full cluster restart stayed live 105 s after its 45 s TTL: the timer was not recovered (fixed in 2.11.10 / 2.12.1, nats-server #7344). This led to v1.1's minimum version; v1.2 now requires the latest stable release only (2.15.0).
+2. **NATS.Net `CreateAsync` must not be used for lock acquire.** On keys nobody else touches it fails 2.7–20 % of the time on 2.12.15, 2.14.7 and 2.15.0 with `NatsKVCreateException` or `NatsKVWrongLastRevisionException`. On a tombstoned key it re-reads the entry through Direct Get (NATS.Net 3.3.0 create path), and a lagging replica returns the old lock or revision. The design's helper acquire with a leader read replaces it.
+3. **Lock operations saturate 0.5 CPU NATS nodes** at about 1 700–2 000 lock ops/s (850–1 000 cycles/s). This is one closed-loop point; the K3 budget stays provisional until the milestone-6 worker sweep.
+4. **10164 is transient.** nats-server 2.14/2.15 return it before proposal while another write to the same subject is in flight, so nothing was stored. The helper retries the identical publish (6 sends, about 124 ms at most); if it is still refused, the outcome is Unknown and is settled with a leader read. Helper contention retried 724 of them with 0 errors.
+5. **Unknown outcomes must be handled, and an acquire must recognise its own token.** Corrected in review 6: expected-sequence errors never coexist with a commit. The only way a write commits while the client sees an error is a lost reply, timeout or reconnect. The helper now treats those as Unknown, resends with the same `Nats-Msg-Id` (the server dedups, returning the original sequence), and otherwise settles by a leader read, where finding its own token means it owns the lock. The failover test exercised this path: 10 unknown outcomes and 2 duplicate acks across two leader restarts, all resolved, with 0 stuck locks. The earlier "16 % self-lockout on 2.14.7" was most likely locks stuck after exceptions the old helper did not catch; that code no longer exists.
 
 ## Answered, no change needed
 
-- Delete markers, CAS against a marker revision, DEL through the helper and the text of error 10071 behave as sections 3 and 5 describe.
-- The leader read is cheap enough for every fence, HWM and acquire retry.
-- Overwrites and renewals of TTL'd messages keep the new TTL; the old timer does not fire on the replacement.
-- The ordered consumer's silent skip is real, and the stream-sequence gap check catches it.
+- Delete markers, CAS on a marker revision, DEL through the helper, the text of 10071 and msg-id dedup behave as sections 3 and 5 describe.
+- The leader read (`INatsJSStream.GetAsync`, which exists in NATS.Net 3.3.0 although it is not in the XML docs) costs about the same as Direct Get at p50.
+- Overwrites and renewals of TTL'd messages keep the new TTL on 2.15.0.
+- The ordered consumer's silent skip is real, and the section-7 sequence-gap check catches it.
+
+## Earlier runs (before design v1.2)
+
+The same suite, without the review-6 fixes, was run on 2.12.15, 2.14.7 and 2.11.2. The server behaviour matched 2.15.0 except for the 2.11.2 restart failure (finding 1) and throughput: 2.11.2 was about 35 % faster, with about 2 750 lock ops/s and cycle p99 22 ms. These versions are no longer supported or tested.
 
 ## Not covered yet
 
-- Chaos faults (C1–C8), CPU-limited .NET nodes, and throughput at more than one concurrency level (milestones 5–6).
+- Chaos faults C1–C8 against the .NET nodes, CPU-limited .NET nodes, and throughput at more than one concurrency level (milestones 5–6).
+- Dedup memory on the stream leader at sustained lock rates (about 240 000 msg ids in the 2-minute window at 2 000 lock ops/s).
 - The host has 12 logical CPUs (6 cores with SMT). The scaled rig fits; the full-size profile must be measured before its numbers are trusted.
