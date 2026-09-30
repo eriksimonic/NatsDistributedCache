@@ -1,6 +1,6 @@
 # NATS Distributed Cache for .NET 10: Design Document
 
-Sep 30, 2026 · Erik Simonič · Status: v1.1 (frozen after the milestone-1 spike, review 5 and the follow-up spike tests). Changes from here go through a new review and a version bump
+Sep 30, 2026 · Erik Simonič · Status: v1.2 (NATS requirement changed to the latest stable release; frozen after review 6). Changes from here go through a new review and a version bump
 
 From v1.1 on this file is the source of truth; the online draft used up to v1.0 is no longer maintained. Spike evidence: `spike/RESULTS.md`.
 
@@ -100,7 +100,7 @@ NuGet dependencies: `NATS.Net` (pinned 3.3.0, the version the spike ran; include
 
 ## 3. NATS topology and buckets
 
-The library needs NATS Server 2.12.1 or newer (decided in v1.1: the rig pins 2.12.15 and CI also runs against 2.12.1 and the latest 2.14.x, because 2.12.x no longer receives fixes (2.12.15 was its last release). TTL'd buckets are never purged or rolled up: TTL bug nats-server #8594 (timer entries leak on purge/rollup) is fixed only in 2.14.8 / 2.15.1. The milestone-1 spike showed that 2.11.2 does not resume per-key TTL timers after a full cluster restart, so a lock held during a restart would never expire; this is fixed in 2.11.10 and 2.12.1, nats-server #7344, and we test only 2.12+. Delete markers on TTL expiry, #6741, are present in both), because per-key TTL in KV (`AllowMsgTTL`) is what makes jittered L2 expiry and self-expiring locks possible without a sweeper. All stores are replicated R3 across the 3-node cluster, so any single NATS node can die without data loss or unavailability.
+The library requires the latest stable NATS Server release, currently 2.15.0 (decided in v1.2: we support only the latest stable minor line and upgrade the pin when a new stable release ships, after the spike suite passes on it; release candidates are never pinned. The full spike suite passes on 2.15.0. History that motivates the policy: 2.11.2 does not resume per-key TTL timers after a full restart, nats-server #7344, and 2.12.x no longer receives fixes. TTL'd buckets are never purged or rolled up: TTL bug #8594, timer entries leaking on purge/rollup, is fixed in 2.15.1, which is still a release candidate), because per-key TTL in KV (`AllowMsgTTL`) is what makes jittered L2 expiry and self-expiring locks possible without a sweeper. All stores are replicated R3 across the 3-node cluster, so any single NATS node can die without data loss or unavailability.
 
 Storage rule (decided): every NATS store (`{prefix}_cache`, `{prefix}_locks`, `{prefix}_notifications`, `{prefix}_objects`) uses file storage; memory storage is never used. The library creates them with `StorageType.File` and treats an existing memory store as a provisioning failure (NATS can't change storage type in place): it logs an error and the node reports Unhealthy (Closed) or Degraded (Open); the process never crashes. Each NATS node keeps its JetStream `store_dir` on a persistent volume, so all data survives a full cluster restart. The server config sets `jetstream.sync_interval` explicitly to the 2 min default, never `always` (that would fsync every write). Volumes are named Docker volumes, not tmpfs or overlay bind mounts; `docker compose down -v` wipes them. The `_locks` MaxAge backstop stays and is tested in C4.
 
@@ -388,7 +388,7 @@ Scaled rig (decided): the dev machine has 12 logical CPUs (6 cores with SMT, cor
 
 | Service | Replicas | CPU | Memory | Image / runtime |
 | --- | --- | --- | --- | --- |
-| `nats-1..3` | 3 | 0.5 each (scaled; 1.0 full size) | 1 GB each (Q14) | `nats:2.12.15-alpine`, JetStream on with `store_dir` on a named volume per node (`nats-1-data` … `nats-3-data`), cluster routes, monitoring on 8222 |
+| `nats-1..3` | 3 | 0.5 each (scaled; 1.0 full size) | 1 GB each (Q14) | `nats:2.15.0-alpine` (latest stable), JetStream on with `store_dir` on a named volume per node (`nats-1-data` … `nats-3-data`), cluster routes, monitoring on 8222 |
 | `api-1..5` | 5 | 0.25 each (scaled; 0.5 full size) | 256 MB each (Q14) | `mcr.microsoft.com/dotnet/aspnet:10.0`, TestApi |
 | `lb` | 1 | unlimited | — | Envoy (envoyproxy/envoy), round-robin (or random) to the 5 APIs |
 | `origin` | 1 | unlimited | — | .NET 10 minimal API: fake backend with delay, per-key version, call ledger |
@@ -513,7 +513,7 @@ The Validator prints a table of invariants × scenarios with pass/fail and the o
 | — | Resurrection race | Fenced (expected-revision) factory writes; fence rule revised after review (section 5) |
 | — | Lease timing | Draft defaults, overridable globally and per call |
 | — | Telemetry | Meter + ActivitySource in library, OTel in TestApi |
-| — | NATS version | Pin 2.12.15; minimum 2.12.1 (v1.1: 2.11.2 does not resume TTL timers after restart, spike-verified, #7344) |
+| — | NATS version | Latest stable release only, currently 2.15.0 (v1.2); pin moves forward after the spike suite passes on the new release |
 | — | Lock acquire | Publish helper + leader read, never NATS.Net `CreateAsync` (v1.1, spike-verified) |
 | — | JWT single-flight evidence | Counters only (I2), no overlap check |
 
@@ -529,7 +529,7 @@ The Validator prints a table of invariants × scenarios with pass/fail and the o
 
 ### Milestones
 
-1. Done (Sep 30, 2026; `spike/RESULTS.md`). Spike on NATS 2.12.15 and 2.11.2: per-key TTL and delete markers on expiry; CAS against a marker revision; TTL timers resuming after a full restart on file storage; lock create/delete throughput on file-backed R3 at 0.5 CPU with the default `sync_interval`; Direct Get staleness under load; leader-read latency at 0.5 CPU; ordered consumer started below FirstSeq (silent skip?); meta-only watch delivering TTL markers; DEL through the publish helper; `Create` contention.
+1. Done (Sep 30, 2026; `spike/RESULTS.md`). Spike on NATS 2.15.0 (current requirement), 2.14.7, 2.12.15 and 2.11.2: per-key TTL and delete markers on expiry; CAS against a marker revision; TTL timers resuming after a full restart on file storage; lock create/delete throughput on file-backed R3 at 0.5 CPU with the default `sync_interval`; Direct Get staleness under load; leader-read latency at 0.5 CPU; ordered consumer started below FirstSeq (silent skip?); meta-only watch delivering TTL markers; DEL through the publish helper; `Create` contention.
 2. Core library: L1/L2, jitter, key validation, bucket provisioning, unit tests.
 3. Distributed single-flight with leases, renewal, fencing; integration tests.
 4. Invalidation stream, reconnect resume, degraded mode.
@@ -642,3 +642,13 @@ Verdict: freeze v1.1 with small edits; milestone 2 is clear to start. Three spik
 | #7344 also in 2.11.10 | Low | Version text corrected |
 | Rule gaps: 10037 after 10071; release revision and ordering | Low | Written into the Acquire and Release rows |
 | Stale text: 6-CPU, NATS.Net v2, TTL only on CreateAsync | Low | Corrected; NATS.Net pinned 3.3.0 |
+
+### v1.2: NATS version requirement (Sep 30, 2026)
+
+The owner set the requirement to the latest stable NATS release. The full spike suite passes on 2.15.0 (13 of 13 checks; `lock-throughput-kv` fails by design as evidence).
+
+| Change | Detail |
+| --- | --- |
+| Required server version | Latest stable only, currently 2.15.0; no older lines are supported or tested |
+| Upgrade policy | Move the pin when a new stable release ships and the spike suite passes on it; never pin a release candidate |
+| CI | Runs the spike suite and later the system tests on the pinned release only |

@@ -2,9 +2,13 @@
 
 Sep 30, 2026. Rig: 3-node NATS cluster in docker compose, file storage on named volumes, R3, 0.5 CPU per node (`cpu_period` 10 ms, `cpu_quota` 5 ms), 1 GB each, `sync_interval: 2m`. Client: NATS.Net 3.3.0 on .NET 10, running on the host (loopback, so latencies are a lower bound). Buckets: History 1, `LimitMarkerTTL` 2 s (short, to keep the tests fast).
 
-Run it with `./run-spike.sh [image]`. Raw results land in `results/` (not committed). Final runs: 2.12.15 and 2.14.7, all tests pass; `lock-throughput-kv` is kept as evidence and is expected to fail. 2.11.2 was run once and is no longer supported (finding 1).
+Run it with `./run-spike.sh [image]` (default: `nats:2.15.0-alpine`, the latest stable release and, from design v1.2, the only supported version). Raw results land in `results/` (not committed). Final runs: 2.12.15 and 2.14.7, all tests pass; `lock-throughput-kv` is kept as evidence and is expected to fail. 2.11.2 was run once and is no longer supported (finding 1).
 
-## Summary
+## NATS 2.15.0 (required version from design v1.2)
+
+All checks pass: markers (expiry 3.1 s), CAS on markers, helper DEL, leader read p50 0.54 ms vs Direct Get 0.38 ms, Direct Get 0.2 % stale idle, helper contention (500 acquisitions, max 1 owner, 0 errors, wait p99 239 ms), TTL overwrite and renewals, ordered-consumer silent skip, restart (lock gone after 45.2 s, data survived). Helper lock throughput about 1 690 ops/s (cycle p50 19 ms, p99 40 ms), leader at 49 % of one CPU (its quota). `CreateAsync` still fails 2.8 % on uncontended keys.
+
+## Summary (earlier versions)
 
 | Assumption (DESIGN.md) | 2.12.15 | 2.14.7 | 2.11.2 (first run) | Verdict |
 | --- | --- | --- | --- | --- |

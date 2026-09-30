@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Runs the milestone-1 spike against one NATS version.
-# Usage: ./run-spike.sh [image]   e.g. ./run-spike.sh nats:2.11.2-alpine
+# Usage: ./run-spike.sh [image]   e.g. ./run-spike.sh nats:2.14.7-alpine
 set -euo pipefail
 cd "$(dirname "$0")"
 
-IMAGE="${1:-nats:2.12.15-alpine}"
+IMAGE="${1:-nats:2.15.0-alpine}"
 LABEL="$(echo "$IMAGE" | sed 's/[^0-9.]//g')"
 export NATS_IMAGE="$IMAGE" SPIKE_LABEL="$LABEL" SPIKE_RESULTS="$PWD/results"
 PROJECT="spike-${LABEL//./-}"

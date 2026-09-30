@@ -1,10 +1,10 @@
 # Milestone-1 spike rig: 3-node NATS JetStream cluster, file storage on named volumes,
 # 0.5 CPU per node with a 10 ms CFS period (design section 9, scaled rig).
-# NATS_IMAGE switches between the pinned version and the documented minimum:
-#   NATS_IMAGE=nats:2.11.2-alpine docker compose -p spike-min up -d
+# NATS_IMAGE overrides the pinned version (default: latest stable, 2.15.0):
+#   NATS_IMAGE=nats:2.14.7-alpine docker compose -p spike-old up -d
 
 x-nats: &nats
-  image: ${NATS_IMAGE:-nats:2.12.15-alpine}
+  image: ${NATS_IMAGE:-nats:2.15.0-alpine}
   command: ["-c", "/etc/nats/nats.conf"]
   volumes:
     - ./nats.conf:/etc/nats/nats.conf:ro
