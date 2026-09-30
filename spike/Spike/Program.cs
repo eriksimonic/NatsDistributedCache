@@ -1,7 +1,7 @@
 // Milestone-1 spike: verifies the NATS behaviours DESIGN.md v1.0 depends on.
 // Each test prints a PASS/FAIL line and writes results/<name>.json.
 // Usage: dotnet run -- <all|ttl-markers|cas-marker|del-helper|read-latency|direct-staleness|
-//                       create-contention|lock-throughput-kv|lock-throughput-helper|consumer-below-firstseq|restart-setup|restart-check>
+//                       create-contention|helper-contention|ttl-overwrite|lock-throughput-kv|lock-throughput-helper|consumer-below-firstseq|restart-setup|restart-check>
 
 using System.Diagnostics;
 using System.Text;
@@ -40,6 +40,8 @@ var tests = new Dictionary<string, Func<Task<TestResult>>>
     ["lock-throughput-kv"] = () => LockThroughput("kv"),
     ["lock-throughput-helper"] = () => LockThroughput("helper"),
     ["consumer-below-firstseq"] = () => ConsumerBelowFirstSeq(js0),
+    ["helper-contention"] = HelperContention,
+    ["ttl-overwrite"] = () => TtlOverwrite(cache, locks, js0, nc0),
     ["restart-setup"] = () => RestartSetup(cache, locks),
     ["restart-check"] = RestartCheck,
 };
@@ -98,21 +100,32 @@ async Task<(INatsKVStore cache, INatsKVStore locks)> Setup(NatsKVContext kv)
 
 // The TTL publish helper from design section 3: raw publish to $KV.{bucket}.{key}.
 static async Task<(ulong Seq, int ErrCode, string? Err)> Publish(INatsJSContext js, string bucket, string key,
-    byte[] data, TimeSpan? ttl = null, ulong? expected = null, bool del = false)
+    byte[] data, TimeSpan? ttl = null, ulong? expected = null, bool del = false, string? msgId = null)
 {
     var h = new NatsHeaders();
+    if (msgId is not null) h["Nats-Msg-Id"] = msgId;
     if (ttl is { } t) h["Nats-TTL"] = $"{(int)Math.Ceiling(t.TotalSeconds)}s";
     if (expected is { } e) h["Nats-Expected-Last-Subject-Sequence"] = e.ToString();
     if (del) h["KV-Operation"] = "DEL";
-    try
+    // 10164 ("wrong last sequence" without a sequence) is transient on 2.14: the leader has not yet
+    // applied the previous write to this subject. Retry the identical publish (same expected revision,
+    // same msg id, so a duplicate is deduplicated) after a short backoff.
+    for (var attempt = 0; ; attempt++)
     {
-        var ack = await js.PublishAsync($"$KV.{bucket}.{key}", data, headers: h);
-        ack.EnsureSuccess();
-        return (ack.Seq, 0, null);
-    }
-    catch (NatsJSApiException ex)
-    {
-        return (0, ex.Error.ErrCode, ex.Error.Description);
+        try
+        {
+            var ack = await js.PublishAsync($"$KV.{bucket}.{key}", data, headers: h);
+            ack.EnsureSuccess();
+            return (ack.Seq, 0, null);
+        }
+        catch (NatsJSApiException ex) when (ex.Error.ErrCode == 10164 && attempt < 5)
+        {
+            await Task.Delay(2 << attempt);
+        }
+        catch (NatsJSApiException ex)
+        {
+            return (0, ex.Error.ErrCode, ex.Error.Description);
+        }
     }
 }
 
@@ -137,7 +150,8 @@ static async Task<LeaderMsg?> LeaderGet(NatsConnection nc, string bucket, string
             if (idx > 0) hdrs[line[..idx].Trim()] = line[(idx + 1)..].Trim();
         }
     }
-    return new LeaderMsg((ulong)m["seq"]!, DateTimeOffset.Parse((string)m["time"]!), hdrs);
+    var data = (string?)m["data"] is { } d64 ? Encoding.UTF8.GetString(Convert.FromBase64String(d64)) : "";
+    return new LeaderMsg((ulong)m["seq"]!, DateTimeOffset.Parse((string)m["time"]!), hdrs, data);
 }
 
 static async Task<ulong?> WaitForDeleted(INatsKVStore kv, string key, TimeSpan timeout)
@@ -360,6 +374,7 @@ async Task<TestResult> LockThroughput(string mode)
     long cycles = 0, errors = 0;
     var latencies = new List<double>();
     var errorKinds = new System.Collections.Concurrent.ConcurrentDictionary<string, int>();
+    var traces = new List<string>();
     var deadline = DateTime.UtcNow + duration;
     await Task.WhenAll(Enumerable.Range(0, workers).Select(async w =>
     {
@@ -380,8 +395,13 @@ async Task<TestResult> LockThroughput(string mode)
                 }
                 else
                 {
-                    var rev = await HelperAcquire(js, nc, LocksBucket, key, TimeSpan.FromSeconds(12))
-                              ?? throw new InvalidOperationException("spurious lost acquire");
+                    var trace = new List<string>();
+                    var rev = await HelperAcquire(js, nc, LocksBucket, key, TimeSpan.FromSeconds(12), trace);
+                    if (rev is null)
+                    {
+                        lock (traces) if (traces.Count < 5) traces.Add(string.Join(" | ", trace));
+                        throw new InvalidOperationException("spurious lost acquire");
+                    }
                     var rel = await Publish(js, LocksBucket, key, [], expected: rev, del: true);
                     if (rel.ErrCode != 0) throw new InvalidOperationException($"release {rel.ErrCode}");
                 }
@@ -404,27 +424,142 @@ async Task<TestResult> LockThroughput(string mode)
         ["cycleP50Ms"] = Pct(latencies, 50), ["cycleP99Ms"] = Pct(latencies, 99), ["errors"] = errors,
         ["errorPct"] = Math.Round(100.0 * errors / Math.Max(1, cycles + errors), 2),
         ["errorKinds"] = JsonSerializer.Serialize(errorKinds),
+        ["failedAcquireTraces"] = traces,
     });
 }
 
-// Acquire: publish expecting an empty subject; on 10071 read the last message from the leader and,
-// if it is a tombstone or TTL marker, publish again expecting exactly that sequence.
-static async Task<ulong?> HelperAcquire(INatsJSContext js, NatsConnection nc, string bucket, string key, TimeSpan ttl)
+// Acquire (DESIGN.md v1.1 section 5): publish expecting an empty subject. On 10071 the error text
+// names the subject's last sequence: 0 = empty now (marker expired) -> expect 0; otherwise leader-read
+// that message: tombstone or TTL marker -> expect its sequence; live token -> held. At most 3 attempts.
+// 10164 is treated like a 10071 without a sequence.
+static async Task<ulong?> HelperAcquire(INatsJSContext js, NatsConnection nc, string bucket, string key, TimeSpan ttl, List<string>? trace = null)
 {
-    var first = await Publish(js, bucket, key, "owner"u8.ToArray(), ttl, expected: 0);
-    if (first.ErrCode == 0) return first.Seq;
-    if (first.ErrCode != 10071) throw new InvalidOperationException($"acquire {first.ErrCode} {first.Err}");
-    var last = await LeaderGet(nc, bucket, key);
+    // A unique token per acquire: a publish that committed but was reported as failed (client retry,
+    // lost ack) shows up in the leader read as our own token, which means we own the lock.
+    var token = $"owner:{Guid.NewGuid():N}";
+    var tokenBytes = Encoding.UTF8.GetBytes(token);
     var expected = 0UL;
-    if (last is not null)
+    for (var attempt = 0; attempt < 3; attempt++)
     {
+        var r = await Publish(js, bucket, key, tokenBytes, ttl, expected: expected, msgId: $"{token}:{attempt}");
+        trace?.Add($"pub(exp {expected}) -> {(r.ErrCode == 0 ? $"ok {r.Seq}" : $"{r.ErrCode} {r.Err}")}");
+        if (r.ErrCode == 0) return r.Seq;
+        // 10071 names the last sequence; 10164 (clustered: another write to this subject is in flight)
+        // does not, so it always goes through the leader read.
+        if (r.ErrCode is not (10071 or 10164)) throw new InvalidOperationException($"acquire {r.ErrCode} {r.Err}");
+        if (r.ErrCode == 10071 && LastSeqFromError(r.Err) == 0) { expected = 0; continue; }
+        var last = await LeaderGet(nc, bucket, key);
+        trace?.Add(last is null ? "leader -> none" : $"leader -> seq {last.Seq} hdrs {string.Join(";", last.Headers.Select(h => $"{h.Key}={h.Value}"))}");
+        if (last is null) { expected = 0; continue; }
         var free = last.Headers.ContainsKey("Nats-Marker-Reason")
                    || last.Headers.GetValueOrDefault("KV-Operation") is "DEL" or "PURGE";
-        if (!free) return null; // held by a live owner
+        if (!free) return last.Data == token ? last.Seq : null; // our own committed write, or a live owner
         expected = last.Seq;
     }
-    var second = await Publish(js, bucket, key, "owner"u8.ToArray(), ttl, expected: expected);
-    return second.ErrCode == 0 ? second.Seq : null;
+    return null;
+}
+
+static ulong? LastSeqFromError(string? err)
+{
+    const string prefix = "wrong last sequence: ";
+    var i = err?.IndexOf(prefix, StringComparison.Ordinal) ?? -1;
+    return i >= 0 && ulong.TryParse(err![(i + prefix.Length)..].Trim(), out var seq) ? seq : null;
+}
+
+// Five nodes contend with the helper acquire; the owner releases right away, so releases race the
+// losers' leader reads and second publishes (nats-server #5162 window). Invariant: never two owners.
+async Task<TestResult> HelperContention()
+{
+    const string key = "t10.lock";
+    const int nodes = 5, acquisitionsPerNode = 100;
+    var conns = new List<NatsConnection>();
+    for (var i = 0; i < nodes; i++) conns.Add(await Connect(i));
+    int owners = 0, maxOwners = 0, errors = 0, starved = 0;
+    long lostWhileFreeRetries = 0;
+    var errorKinds = new System.Collections.Concurrent.ConcurrentDictionary<string, int>();
+    void Kind(string k) => errorKinds.AddOrUpdate(k.Length > 90 ? k[..90] : k, 1, (_, x) => x + 1);
+    var waits = new List<double>();
+    await Task.WhenAll(Enumerable.Range(0, nodes).Select(async n =>
+    {
+        var js = new NatsJSContext(conns[n]);
+        var rnd = new Random(n);
+        var local = new List<double>();
+        for (var a = 0; a < acquisitionsPerNode; a++)
+        {
+            var sw = Stopwatch.StartNew();
+            ulong? rev = null;
+            while (rev is null && sw.Elapsed < TimeSpan.FromSeconds(5))
+            {
+                try { rev = await HelperAcquire(js, conns[n], LocksBucket, key, TimeSpan.FromSeconds(12)); }
+                catch (Exception ex) { Interlocked.Increment(ref errors); Kind($"acquire {ex.GetType().Name}: {ex.Message}"); }
+                if (rev is null) { Interlocked.Increment(ref lostWhileFreeRetries); await Task.Delay(rnd.Next(1, 4)); }
+            }
+            if (rev is null) { Interlocked.Increment(ref starved); continue; }
+            local.Add(sw.Elapsed.TotalMilliseconds);
+            var now = Interlocked.Increment(ref owners);
+            int seen;
+            do { seen = maxOwners; } while (now > seen && Interlocked.CompareExchange(ref maxOwners, now, seen) != seen);
+            await Task.Delay(rnd.Next(0, 3)); // hold briefly
+            Interlocked.Decrement(ref owners);
+            var rel = await Publish(js, LocksBucket, key, [], expected: rev, del: true);
+            if (rel.ErrCode != 0) { Interlocked.Increment(ref errors); Kind($"release {rel.ErrCode} {rel.Err}"); }
+        }
+        lock (waits) waits.AddRange(local);
+    }));
+    foreach (var c in conns) await c.DisposeAsync();
+    return new TestResult("helper-contention", maxOwners == 1 && errors == 0 && starved == 0, new()
+    {
+        ["nodes"] = nodes, ["acquisitions"] = waits.Count, ["maxConcurrentOwners"] = maxOwners,
+        ["errors"] = errors, ["starved"] = starved, ["heldRetries"] = lostWhileFreeRetries,
+        ["acquireWaitP50Ms"] = Pct(waits, 50), ["acquireWaitP99Ms"] = Pct(waits, 99),
+        ["errorKinds"] = JsonSerializer.Serialize(errorKinds),
+    });
+}
+
+// Overwriting a TTL'd message must not let the old timer remove or marker the new one; renewals keep
+// a lease alive past its original TTL, and it expires one TTL after the last renewal.
+async Task<TestResult> TtlOverwrite(INatsKVStore kv, INatsKVStore lk, INatsJSContext js, NatsConnection nc)
+{
+    const string key = "t11.k";
+    var first = await Publish(js, CacheBucket, key, "short"u8.ToArray(), TimeSpan.FromSeconds(5));
+    var second = await Publish(js, CacheBucket, key, "long"u8.ToArray(), TimeSpan.FromSeconds(60), expected: first.Seq);
+    await Task.Delay(TimeSpan.FromSeconds(10));
+    string op; ulong? rev = null;
+    try { var e = await kv.GetEntryAsync<string>(key); op = e.Value ?? ""; rev = e.Revision; }
+    catch (NatsKVKeyDeletedException) { op = "deleted"; }
+    catch (NatsKVKeyNotFoundException) { op = "not-found"; }
+    var leader = await LeaderGet(nc, CacheBucket, key);
+    var overwriteOk = op == "long" && rev == second.Seq && leader is { } l && !l.Headers.ContainsKey("Nats-Marker-Reason");
+
+    const string lease = "t11.lease";
+    var leaseTtl = TimeSpan.FromSeconds(5);
+    var cur = await HelperAcquire(js, nc, LocksBucket, lease, leaseTtl) ?? 0;
+    var renewals = 0;
+    var sw = Stopwatch.StartNew();
+    while (sw.Elapsed < TimeSpan.FromSeconds(15))
+    {
+        await Task.Delay(TimeSpan.FromSeconds(1.5));
+        var r = await Publish(js, LocksBucket, lease, "owner"u8.ToArray(), leaseTtl, expected: cur);
+        if (r.ErrCode != 0) break;
+        cur = r.Seq; renewals++;
+    }
+    var aliveAfterRenewals = false;
+    try { aliveAfterRenewals = (await lk.GetEntryAsync<string>(lease)).Revision == cur; } catch (NatsKVException) { }
+    var stop = Stopwatch.StartNew();
+    double? expiredAfterS = null;
+    while (stop.Elapsed < TimeSpan.FromSeconds(15))
+    {
+        try { await lk.GetEntryAsync<string>(lease); }
+        catch (NatsKVException) { expiredAfterS = stop.Elapsed.TotalSeconds; break; }
+        await Task.Delay(100);
+    }
+    var pass = overwriteOk && renewals >= 9 && aliveAfterRenewals && expiredAfterS is >= 3.5 and <= 7;
+    return new TestResult("ttl-overwrite", pass, new()
+    {
+        ["afterOverwrite"] = op, ["revIsReplacement"] = rev == second.Seq, ["overwriteOk"] = overwriteOk,
+        ["renewals"] = renewals, ["aliveAfter15sOfRenewals"] = aliveAfterRenewals,
+        ["expiredAfterLastRenewalS"] = expiredAfterS is null ? null : Math.Round(expiredAfterS.Value, 2),
+    });
 }
 
 // Ordered consumer asked to start below FirstSeq (events already discarded): error or silent skip?
@@ -506,4 +641,4 @@ async Task<TestResult> RestartCheck()
 }
 
 record TestResult(string Name, bool Pass, Dictionary<string, object?> Details);
-record LeaderMsg(ulong Seq, DateTimeOffset Time, Dictionary<string, string> Headers);
+record LeaderMsg(ulong Seq, DateTimeOffset Time, Dictionary<string, string> Headers, string Data);

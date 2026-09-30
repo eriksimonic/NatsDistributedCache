@@ -1,8 +1,8 @@
 # NATS Distributed Cache for .NET 10: Design Document
 
-Sep 30, 2026 · Erik Simonič · Status: v1.0 (frozen after review 4). Changes from here go through a new review and a version bump
+Sep 30, 2026 · Erik Simonič · Status: v1.1 (frozen after the milestone-1 spike, review 5 and the follow-up spike tests). Changes from here go through a new review and a version bump
 
-Source of truth while drafting: https://claude.ai/code/artifact/cfc4a65c-4a94-48a7-82ae-39444cedf905
+From v1.1 on this file is the source of truth; the online draft used up to v1.0 is no longer maintained. Spike evidence: `spike/RESULTS.md`.
 
 ## 1. Overview and goals
 
@@ -68,7 +68,7 @@ The facade also publishes to the notifications stream on every write; the Origin
 | `L1Store` | Wraps `Microsoft.Extensions.Caching.Memory`; size limit, jittered TTL, per-entry revision |
 | `L2Store` | JetStream KV `{prefix}_cache`; get/put/delete with revision, per-message TTL |
 | `LocalSingleFlight` | In-process dedupe (one `Task` per key per node) before any network lock |
-| `DistributedLock` | KV `{prefix}_locks`; create-if-absent lease with TTL, owner id, release by revision |
+| `DistributedLock` | KV `{prefix}_locks`; create-if-absent lease with TTL through the publish helper (never NATS.Net `CreateAsync`, section 5), owner id, release by revision |
 | `InvalidationBus` | Publishes and consumes eviction events on `{prefix}_notifications` |
 | `ConnectionSupervisor` | Connection state, reconnect, resync of L1 after outages, health checks |
 | `ICacheSerializer` | Pluggable; default System.Text.Json with source generators, optional MessagePack |
@@ -96,11 +96,11 @@ deploy/
 docs/
 ```
 
-NuGet dependencies: `NATS.Net` (v2.x, includes `NATS.Client.KeyValueStore` and JetStream), `Microsoft.Extensions.Caching.Memory`, `Microsoft.Extensions.Options`, `Microsoft.Extensions.Hosting.Abstractions`.
+NuGet dependencies: `NATS.Net` (pinned 3.3.0, the version the spike ran; includes `NATS.Client.KeyValueStore` and JetStream), `Microsoft.Extensions.Caching.Memory`, `Microsoft.Extensions.Options`, `Microsoft.Extensions.Hosting.Abstractions`.
 
 ## 3. NATS topology and buckets
 
-The library needs NATS Server 2.11 or newer (decided: the rig pins 2.12.15; the hard minimum is 2.11.2 (delete markers on per-message-TTL expiry, nats-server #6741), 2.12.1+ is preferred (TTL timers recovered after restart, #7344), and CI also runs against the minimum), because per-key TTL in KV (`AllowMsgTTL`) is what makes jittered L2 expiry and self-expiring locks possible without a sweeper. All stores are replicated R3 across the 3-node cluster, so any single NATS node can die without data loss or unavailability.
+The library needs NATS Server 2.12.1 or newer (decided in v1.1: the rig pins 2.12.15 and CI also runs against 2.12.1 and the latest 2.14.x, because 2.12.x no longer receives fixes (2.12.15 was its last release). TTL'd buckets are never purged or rolled up: TTL bug nats-server #8594 (timer entries leak on purge/rollup) is fixed only in 2.14.8 / 2.15.1. The milestone-1 spike showed that 2.11.2 does not resume per-key TTL timers after a full cluster restart, so a lock held during a restart would never expire; this is fixed in 2.11.10 and 2.12.1, nats-server #7344, and we test only 2.12+. Delete markers on TTL expiry, #6741, are present in both), because per-key TTL in KV (`AllowMsgTTL`) is what makes jittered L2 expiry and self-expiring locks possible without a sweeper. All stores are replicated R3 across the 3-node cluster, so any single NATS node can die without data loss or unavailability.
 
 Storage rule (decided): every NATS store (`{prefix}_cache`, `{prefix}_locks`, `{prefix}_notifications`, `{prefix}_objects`) uses file storage; memory storage is never used. The library creates them with `StorageType.File` and treats an existing memory store as a provisioning failure (NATS can't change storage type in place): it logs an error and the node reports Unhealthy (Closed) or Degraded (Open); the process never crashes. Each NATS node keeps its JetStream `store_dir` on a persistent volume, so all data survives a full cluster restart. The server config sets `jetstream.sync_interval` explicitly to the 2 min default, never `always` (that would fsync every write). Volumes are named Docker volumes, not tmpfs or overlay bind mounts; `docker compose down -v` wipes them. The `_locks` MaxAge backstop stays and is tested in C4.
 
@@ -115,7 +115,7 @@ History = 1 is a hard invariant for `_cache` and `_locks` (after review 4): the 
 
 ### Writes with TTL and fencing (after review)
 
-NATS.Net accepts a TTL only on `CreateAsync`; `PutAsync` and `UpdateAsync` have no TTL, and an `UpdateAsync` replaces a TTL'd entry with one that never expires. So every write that needs a TTL (Set, the fenced factory write, lease renewal) goes through one helper that publishes directly to `$KV.{bucket}.{key}` via `INatsJSContext.PublishAsync` with two headers: `Nats-TTL` and `Nats-Expected-Last-Subject-Sequence` (when a revision is expected). Both KV buckets must be created with `LimitMarkerTTL` ≥ 1 s (NATS.Net rejects less) (server `allow_msg_ttl` + `subject_delete_marker_ttl`), otherwise NATS.Net refuses TTL operations. KV buckets always discard new, so a bucket at `MaxBytes` rejects writes; the library then logs, counts `cache.l2_full` and serves the value uncached.
+NATS.Net 3.3.0 accepts a TTL only on `CreateAsync` and `PurgeAsync` (purge is never used on TTL'd buckets, section 3); `PutAsync` and `UpdateAsync` have no TTL, and an `UpdateAsync` replaces a TTL'd entry with one that never expires. So every write that needs a TTL (Set, the fenced factory write, lock acquire and lease renewal) goes through one helper that publishes directly to `$KV.{bucket}.{key}` via `INatsJSContext.PublishAsync` with two headers: `Nats-TTL` and `Nats-Expected-Last-Subject-Sequence` (when a revision is expected), plus a `Nats-Msg-Id` so a resent publish is deduplicated. Error 10164 ("wrong last sequence" without a sequence) is transient: the stream leader has not yet applied the previous write to the subject, which the spike hit on back-to-back writes such as acquire → release on 2.14.7. The helper retries the identical publish (same expected revision and msg id) up to 5 times with 2–64 ms backoff; 10071 is never retried blindly. Both KV buckets must be created with `LimitMarkerTTL` ≥ 1 s (NATS.Net rejects less) (server `allow_msg_ttl` + `subject_delete_marker_ttl`), otherwise NATS.Net refuses TTL operations. KV buckets always discard new, so a bucket at `MaxBytes` rejects writes; the library then logs, counts `cache.l2_full` and serves the value uncached.
 
 ### Internal keys, leader reads and deletes (after review 3)
 
@@ -236,22 +236,22 @@ Update is the same as Set in v1, plus a compare-and-swap `UpdateAsync(key, rev, 
 
 ## 5. Distributed single-flight factory per key
 
-A key's factory runs on exactly one node at a time: the node that wins an atomic KV `Create` on `{prefix}_locks/{internalKey}` runs it, everyone else waits for the value to land in L2. Two layers keep lock traffic low: local single-flight collapses all callers on one node to one contender, so at most 5 nodes (not thousands of requests) race for a lock.
+A key's factory runs on exactly one node at a time: the node that wins the atomic acquire (below) on `{prefix}_locks/{internalKey}` runs it, everyone else waits for the value to land in L2. Two layers keep lock traffic low: local single-flight collapses all callers on one node to one contender, so at most 5 nodes (not thousands of requests) race for a lock.
 
 ### Lock protocol
 
 | Step | Operation | Notes |
 | --- | --- | --- |
-| Acquire | `kv.CreateAsync(key, token, ttl: LeaseTtl)` | Succeeds only if the key is absent or tombstoned; atomic across the cluster via the stream leader; a TTL marker counts as absent. A spurious wrong-last-sequence error when a release lands mid-Create (nats-server #5162) counts as lost: retry, never surface |
+| Acquire | TTL publish helper: publish a unique token (fresh per acquire) with `Nats-TTL` = LeaseTtl, expecting last subject sequence 0. On 10071, leader-read the last message: a tombstone (`KV-Operation: DEL` or `PURGE`) or a TTL marker (`Nats-Marker-Reason`) means free, so publish again expecting exactly that sequence; a live token means held (lost). A 10071 on the second publish is interpreted by the sequence in its text (`wrong last sequence: {seq}`): seq 0 (the marker expired meanwhile) → publish again expecting 0; seq > S → repeat the leader-read step (e.g. a MaxAge marker replaced the tombstone); a live token → lost, unless it is this acquire's own token: a publish can commit while the client sees an error (lost ack or resend), and the spike showed that without this check an idle node locked itself out for a full LeaseTtl (16 % failed cycles on 2.14.7). A 10037 (no message) from the leader read → publish expecting 0. At most 3 attempts, then lost | Never NATS.Net `CreateAsync` (changed in v1.1): on a tombstoned key it re-reads through Direct Get, and the spike measured 4.4–5.3 % spurious failures on uncontended keys on 2.12.15, each of which would make an idle node wait for a factory nobody runs. The helper acquire had 0 failures in 30 000+ cycles and was slightly faster. Atomic across the cluster via the stream leader; a release racing the second publish (nats-server #5162) can only produce a lost result, never two owners |
 | Token | `{nodeId}:{guid}:{unixMs}:{leaseMs}:{factoryTimeoutMs}` | Identifies the owner; carries the owner's LeaseTtl and FactoryTimeout so waiters cap their wait with the owner's values; logged for validation |
 | Lease TTL | `FactoryTimeout + 2 s` | Server-side per-key TTL, so a crashed owner's lock disappears by itself. Decided: this is only the default; LeaseTtl, FactoryTimeout and LockWaitTimeout can be overridden globally and per call. A per-call LeaseTtl above `MaxLeaseTtl` (default 60 s) throws; `_locks` MaxAge = 2 × MaxLeaseTtl |
 | Renew | TTL publish helper (key, token, expected revision, `Nats-TTL`) every `LeaseTtl / 3` | Done with the TTL publish helper (expected revision + `Nats-TTL`), never KV `UpdateAsync`, which would drop the TTL and leave a lock that never expires. Only for factories that run longer than one lease; stops if the revision check fails |
-| Release | `kv.DeleteAsync(key, expectedRevision)` | Only the current owner can release; a stale owner's release is a no-op |
+| Release | DEL marker through the publish helper, expecting the owner's latest revision (the last renewal's, not the acquire's); it completes before the `fail` or `set` event is published, so waiters that retry on the event never see a live token | Only the current owner can release; a stale owner's release gets 10071 and is a no-op (spike-verified) |
 | Wake waiters | Value lands in L2 plus a `set` notification | Woken via the notifications stream, not a per-key KV watch, for `{prefix}_cache/{internalKey}` and also poll every 250 ms as a fallback |
 
 ### Waiter behaviour
 
-1. Lose `Create` → register in the node's local waiter table (no new NATS consumer). The node's single notifications consumer wakes the waiter on the key's set, del or fail event; as a fallback it polls L2 and the lock key every 250 ms (decided).
+1. Lose the acquire → register in the node's local waiter table (no new NATS consumer). The node's single notifications consumer wakes the waiter on the key's set, del or fail event; as a fallback it polls L2 and the lock key every 250 ms (decided).
 2. Cache key gets a value → return it.
 3. Lock key deleted or expired without a value (owner failed or crashed) → retry acquire, with a small random backoff (10–50 ms) so waiters do not all hit the server at once.
 4. `LockWaitTimeout` reached → if the lock revision changed since the last check (the owner is renewing), keep waiting, but at most the owner's FactoryTimeout + LeaseTtl (read from the lock value) past the first observed lease revision; otherwise apply FailureMode (Q1): Open runs the factory locally (its result reaches L2 only through the fenced write) and the run is logged as a degraded window, Closed throws.
@@ -330,7 +330,7 @@ Subject `{prefix}.notify.{internalKey}` on stream `{prefix}_notifications` (`key
 
 ### Per-key high-water revision (after review 2)
 
-Compare-on-revision alone misses one race: a node reads rev 10 from L2, the rev 11 event arrives while its L1 is empty (nothing to evict), and the node then fills L1 with rev 10. KV reads also use Direct Get, which any replica may answer without read-after-write coherency, so a read after the rev 11 event can still return rev 10. Each node therefore keeps a high-water revision (HWM) per internal key: the highest revision it has served or seen in a `set` or `del` event. L1 is filled only with entries at or above the HWM; a lower L2 read is re-read once from the stream leader, and if still lower the newest value seen is returned without filling L1. A new Set after a delete gets a higher revision than the tombstone, so the HWM never blocks it. HWM entries live for `L1Ttl × (1 + j)` and count toward the L1 size limit.
+Compare-on-revision alone misses one race: a node reads rev 10 from L2, the rev 11 event arrives while its L1 is empty (nothing to evict), and the node then fills L1 with rev 10. KV reads also use Direct Get, which any replica may answer without read-after-write coherency, so a read after the rev 11 event can still return rev 10. Each node therefore keeps a high-water revision (HWM) per internal key: the highest revision it has served or seen in a `set` or `del` event. L1 is filled only with entries at or above the HWM; a lower L2 read is re-read once from the stream leader, and if still lower the newest value seen is returned without filling L1. A new Set after a delete gets a higher revision than the tombstone, so the HWM never blocks it. HWM entries live for `L1Ttl × (1 + j)` and count toward the L1 size limit. Expect leader re-reads to be common under load: the spike measured 0.05 % stale Direct Gets on an idle cluster but about 5 % under lock load (NATS.Net `CreateAsync` failures are that same stale read).
 
 ### Why a stream and not core pub/sub or a KV watch
 
@@ -346,7 +346,7 @@ The L1 TTL stays the final safety net: even if every event were lost, staleness 
 
 The library never needs an app restart to recover: the NATS client reconnects forever with jittered backoff, KV calls retry through a resilience pipeline, and the cache drops to an L1-only degraded mode while NATS is gone (Open mode), then resyncs when it returns.
 
-### Connection settings (NATS.Net v2)
+### Connection settings (NATS.Net 3.3.0)
 
 | Setting | Value | Why |
 | --- | --- | --- |
@@ -382,7 +382,7 @@ Health checks: `/health/live` ignores NATS; `/health/ready` reports `Degraded` (
 
 The test rig is one docker compose file: a 3-node NATS JetStream cluster, 5 TestApi replicas behind Envoy, a separate Origin service that plays the slow backend and counts every factory call, plus Prometheus and Grafana. k6 and the Validator run outside the resource limits so they never become the bottleneck. (Kubernetes with a StatefulSet for NATS is the alternative, Q13.)
 
-Scaled rig (decided): the dev machine has 6 CPUs, so every limit is halved: NATS 0.5 CPU each, API 0.25 CPU each, 2.75 CPU in total. That leaves about 3 CPU for Envoy, Origin, Prometheus, Grafana and k6. API and NATS containers set `cpu_period` to 10 ms (quota 2.5 ms for 0.25 CPU), so a throttled container stalls at most 7.5 ms instead of 75 ms and, after review, NATS and API containers are pinned with cpuset to cores 0–2 while Envoy, Origin, observability and k6 run on cores 3–5, so neighbours can't steal CPU. A request needing more than 2.5 ms CPU spans two periods, so latency gates are set from the first K1 run, with the warm-up stage excluded. Cores 0–2 carry 2.75 CPU of quota with little headroom for Raft and disk I/O, so expect some throttling noise in latency results. RPS targets are halved to 2 500; the correctness invariants are unchanged. The full-size profile (1 / 0.5 CPU) stays as a compose override for a bigger machine.
+Scaled rig (decided): the dev machine has 12 logical CPUs (6 cores with SMT, corrected in v1.1), and every limit stays halved: NATS 0.5 CPU each, API 0.25 CPU each, 2.75 CPU in total. That leaves about 3 CPU for Envoy, Origin, Prometheus, Grafana and k6. API and NATS containers set `cpu_period` to 10 ms (quota 2.5 ms for 0.25 CPU), so a throttled container stalls at most 7.5 ms instead of 75 ms and, after review, NATS and API containers are pinned with cpuset to logical CPUs 0–5 (cores 0–2 with their SMT siblings) while Envoy, Origin, observability and k6 run on logical CPUs 6–11, so neighbours can't steal CPU. A request needing more than 2.5 ms CPU spans two periods, so latency gates are set from the first K1 run, with the warm-up stage excluded. Cores 0–2 carry 2.75 CPU of quota with little headroom for Raft and disk I/O, so expect some throttling noise in latency results. RPS targets are halved to 2 500; the correctness invariants are unchanged. The full-size profile (1 / 0.5 CPU) stays as a compose override; with 12 logical CPUs it may fit on this machine, but it must be measured before its numbers are trusted. Spike baseline (0.5 CPU per NATS node, 16 lock workers, one concurrency level): about 2 000 lock ops/s, cycle p50 12 ms and p99 40 ms, with the stream leader at its CPU quota. This is a single closed-loop point; a sweep of 8/16/32/64 workers reported as helper cycles/s (with CPU sampled during the helper run) replaces it before milestone 6, and the K3 budget is provisional until then.
 
 ### Containers and limits
 
@@ -424,7 +424,7 @@ k6 drives eight scenarios, each with thresholds that fail the run, and tags ever
 | --- | --- | --- | --- | --- |
 | K1 | Baseline mixed load | `ramping-arrival-rate` to max RPS, 95 % reads / 5 % writes, Zipf over 10 000 keys | Capacity of the API tier, hit ratios | errors < 0.1 %; latency gates set from the first run (measure then set), warm-up excluded |
 | K2 | Thundering herd | 1 cold key, 1 000 VUs released at once across all nodes | R1 single-flight | Origin calls for that key = 1; no timeouts |
-| K3 | Herd on many keys | 500 cold keys, about 2 000 VUs using `http.batch` (about 20 requests per key in flight at once) | R1 at scale, lock bucket load | Run in Closed mode: Origin calls with reason ≠ degraded = 500 exactly and degraded = 0; lock ops/s and NATS CPU recorded and gated |
+| K3 | Herd on many keys | 500 cold keys, about 2 000 VUs using `http.batch` (about 20 requests per key in flight at once) | R1 at scale, lock bucket load | Run in Closed mode: Origin calls with reason ≠ degraded = 500 exactly and degraded = 0; lock ops/s and NATS CPU recorded and gated. Budget: the spike measured a ceiling of about 2 000 lock ops/s (about 1 000 cold misses/s) at 0.5 CPU per NATS node; K3's 500 misses are about 1 000 lock ops, so they must complete in well under 1 s of lock time, and a K3 run that approaches the ceiling is reported as capacity-bound, not as a correctness failure |
 | K4 | Synchronized write, jittered expiry | Write 5 000 keys in 1 s, TTL 60 s, then steady reads | R3 jitter | Origin calls spread over ≥ 80 % of the jitter window, peak/mean < 2 |
 | K5 | Update invalidation | 1 writer per key at 10 writes/s; 5 readers pinned to api-1..5 polling every 10 ms | R4 eviction | Time until all 5 nodes serve the new version: p99 < 100 ms, max < 1 s |
 | K6 | Delete invalidation | Delete random hot keys under read load | R5 | No node returns a deleted version after the SLO window |
@@ -500,7 +500,7 @@ The Validator prints a table of invariants × scenarios with pass/fail and the o
 | Q10 | Implement .NET `HybridCache` / `IDistributedCache`? | Implement both wherever the interface is compatible (the spike confirms which members); `RemoveByTagAsync` works for prefix tags and otherwise throws `NotSupportedException`. Registering Microsoft's `AddHybridCache()` together with our `IDistributedCache` logs a startup warning (after review: detection is only reliable when Microsoft's registration comes first) |
 | Q11 | One NuGet package or core + extensions? | Two packages: core (NatsDistributedCache) + extensions (NatsDistributedCache.Extensions: DI and options binding) |
 | Q12 | Serializer and compression? | System.Text.Json source-gen (pluggable), Brotli above a configurable `CompressionThresholdBytes` (default 4 KB, 0 = off) |
-| Q13 | Test rig on docker compose or Kubernetes? | Docker compose on the 6-CPU dev machine, every limit halved (section 9); k8s manifests later |
+| Q13 | Test rig on docker compose or Kubernetes? | Docker compose on the dev machine (12 logical CPUs), every limit halved (section 9); k8s manifests later |
 | Q14 | Memory limits per NATS and API container? | NATS 1 GB, API 256 MB |
 | Q15 | Target RPS, key count, value size, SLO numbers? | First target: 2 500 RPS on the scaled rig (5 000 at full size), 10 000 keys, 1 KB values, SLOs as in section 10; revisit after the K1 capacity run |
 | Q16 | Security: TLS, auth? | Off in the test rig; TLS, user/password, NKey and creds (JWT) supported via options |
@@ -513,7 +513,8 @@ The Validator prints a table of invariants × scenarios with pass/fail and the o
 | — | Resurrection race | Fenced (expected-revision) factory writes; fence rule revised after review (section 5) |
 | — | Lease timing | Draft defaults, overridable globally and per call |
 | — | Telemetry | Meter + ActivitySource in library, OTel in TestApi |
-| — | NATS version | Pin 2.12.15; minimum 2.11.2 (#6741), 2.12.1+ preferred (#7344) |
+| — | NATS version | Pin 2.12.15; minimum 2.12.1 (v1.1: 2.11.2 does not resume TTL timers after restart, spike-verified, #7344) |
+| — | Lock acquire | Publish helper + leader read, never NATS.Net `CreateAsync` (v1.1, spike-verified) |
 | — | JWT single-flight evidence | Counters only (I2), no overlap check |
 
 ### Risks
@@ -528,7 +529,7 @@ The Validator prints a table of invariants × scenarios with pass/fail and the o
 
 ### Milestones
 
-1. Spike on NATS 2.12.15 (and 2.11.2 as the minimum): per-key TTL and delete markers on expiry; CAS against a marker revision; TTL timers resuming after a full restart on file storage; lock create/delete throughput on file-backed R3 at 0.5 CPU with the default `sync_interval`; Direct Get staleness under load; leader-read latency at 0.5 CPU; ordered consumer started below FirstSeq (silent skip?); meta-only watch delivering TTL markers; DEL through the publish helper; `Create` contention.
+1. Done (Sep 30, 2026; `spike/RESULTS.md`). Spike on NATS 2.12.15 and 2.11.2: per-key TTL and delete markers on expiry; CAS against a marker revision; TTL timers resuming after a full restart on file storage; lock create/delete throughput on file-backed R3 at 0.5 CPU with the default `sync_interval`; Direct Get staleness under load; leader-read latency at 0.5 CPU; ordered consumer started below FirstSeq (silent skip?); meta-only watch delivering TTL markers; DEL through the publish helper; `Create` contention.
 2. Core library: L1/L2, jitter, key validation, bucket provisioning, unit tests.
 3. Distributed single-flight with leases, renewal, fencing; integration tests.
 4. Invalidation stream, reconnect resume, degraded mode.
@@ -613,3 +614,31 @@ Verdict: freeze as v1.0 after small edits, no further round. All APIs named in t
 | Default lease above MaxLeaseTtl | Low | Default clamps; explicit value throws |
 | Recovery compares server and local clocks | Low | 1 s skew margin |
 | Tag rev with zero matches; clear subject; tag window | Low | Defined in sections 4 and 7 |
+
+### v1.1: changes from the milestone-1 spike (Sep 30, 2026)
+
+Evidence in `spike/RESULTS.md` (NATS 2.12.15 and 2.11.2, NATS.Net 3.3.0, 0.5 CPU per NATS node).
+
+| Spike finding | Change made |
+| --- | --- |
+| 2.11.2 never expires a TTL'd lock written before a full cluster restart | Minimum server version 2.12.1; CI tests 2.12.1; pin stays 2.12.15 |
+| NATS.Net `CreateAsync` fails spuriously (4.4–5.3 % on 2.12.15) on uncontended tombstoned keys | Acquire through the publish helper with a leader read; release as a helper DEL |
+| Lock operations saturate 0.5 CPU NATS nodes at about 2 000 ops/s | K3 budget and capacity-bound reporting; baseline numbers in section 9 |
+| Host has 12 logical CPUs, not 6 | Section 9 corrected; cpuset mapping by logical CPU; full-size profile to be measured |
+| Markers, CAS on marker revisions, helper DEL, 10071 text, leader-read cost, Direct Get staleness, ordered-consumer silent skip | Confirmed as designed; no change |
+
+### Review 5: Fable, Sep 30 2026 (all findings accepted; v1.1 frozen)
+
+Verdict: freeze v1.1 with small edits; milestone 2 is clear to start. Three spike additions before milestone 3 (results in `spike/RESULTS.md`).
+
+| Finding | Severity | Change made |
+| --- | --- | --- |
+| 2.12.x no longer receives fixes; #8594 TTL leak fixed only in 2.14.8 / 2.15.1 | High | CI matrix adds latest 2.14.x; spike re-run on 2.14.7; never purge or roll up TTL'd buckets |
+| Second-publish 10071 not always "lost" (marker expired, MaxAge marker) | Medium | Acquire interprets the 10071 sequence; 10037 → expect 0; at most 3 attempts |
+| Helper acquire never run under contention; release didn't race losers | Medium | New spike test helper-contention: 500 acquisitions over 5 nodes, never more than one owner, no starvation, on 2.12.15 and 2.14.7. It exposed two more rules, now in section 5: transient 10164 is retried in the helper, and an acquire recognises its own committed token |
+| Overwrite of a TTL'd message and renewals untested | Medium | New spike test ttl-overwrite: the replacement survives the old 5 s timer; 10 renewals keep a 5 s lease alive for 15 s and it expires 5.1 s after the last one (2.12.15 and 2.14.7) |
+| Throughput ceiling is one closed-loop point | Medium | Marked provisional; worker sweep before milestone 6 |
+| Direct Get staleness ~5 % under load | Low | Noted in the HWM section |
+| #7344 also in 2.11.10 | Low | Version text corrected |
+| Rule gaps: 10037 after 10071; release revision and ordering | Low | Written into the Acquire and Release rows |
+| Stale text: 6-CPU, NATS.Net v2, TTL only on CreateAsync | Low | Corrected; NATS.Net pinned 3.3.0 |

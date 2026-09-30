@@ -31,9 +31,10 @@ RUN=(dotnet run --no-build --project Spike --)
 status=0
 "${RUN[@]}" all || status=1
 
-# NATS CPU while the lock-throughput test runs (design: K3 gates on lock ops/s and NATS CPU)
-( sleep 5; docker stats --no-stream --format '{{.Name}} {{.CPUPerc}}' $("${DC[@]}" ps -q) ) > "results/$LABEL-lock-cpu.txt" &
 "${RUN[@]}" lock-throughput-kv || true   # evidence: NATS.Net CreateAsync fails spuriously on tombstones
+
+# NATS CPU while the helper lock-throughput test runs (design: K3 gates on lock ops/s and NATS CPU)
+( sleep 5; docker stats --no-stream --format '{{.Name}} {{.CPUPerc}}' $("${DC[@]}" ps -q) ) > "results/$LABEL-lock-cpu.txt" &
 "${RUN[@]}" lock-throughput-helper || status=1
 wait
 
