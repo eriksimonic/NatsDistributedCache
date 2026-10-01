@@ -1,6 +1,6 @@
 # NATS Distributed Cache for .NET 10: Design Document
 
-Sep 30, 2026 · Erik Simonič · Status: v1.2 (NATS requirement changed to the latest stable release; frozen after review 6). Changes from here go through a new review and a version bump
+Oct 1, 2026 · Erik Simonič · Status: v1.3 (lock-wait, renewal and release rules settled by milestone 3; frozen after review 7). Changes from here go through a new review and a version bump
 
 From v1.1 on this file is the source of truth; the online draft used up to v1.0 is no longer maintained. Spike evidence: `spike/RESULTS.md`.
 
@@ -187,8 +187,8 @@ public sealed record CacheEntryOptions
     public TimeSpan L1Ttl { get; init; } = TimeSpan.FromSeconds(30); // worst-case staleness ~33 s if events are lost
     public double JitterRatio { get; init; } = 0.1;      // ±10 %
     public TimeSpan FactoryTimeout { get; init; } = TimeSpan.FromSeconds(10);
-    public TimeSpan LockWaitTimeout { get; init; } = TimeSpan.FromSeconds(15);
-    public TimeSpan? LeaseTtl { get; init; }                 // default min(FactoryTimeout + 2 s, MaxLeaseTtl); an explicit value above MaxLeaseTtl throws
+    public TimeSpan LockWaitTimeout { get; init; } = TimeSpan.FromSeconds(15); // minimum wait; a live owner extends it (section 5)
+    public TimeSpan? LeaseTtl { get; init; }                 // default FactoryTimeout + 2 s clamped to [MinLeaseTtl, MaxLeaseTtl]; an explicit value outside throws
     public DateTimeOffset? AbsoluteExpiration { get; init; }  // hard expiry, e.g. JWT exp
     public TimeSpan SafetyMargin { get; init; } = TimeSpan.FromSeconds(60);
     public FailureMode? FailureMode { get; init; }            // per-call override of Open | Closed
@@ -205,6 +205,8 @@ services.AddNatsDistributedCache(o => {
     o.LargeValueThresholdBytes = 512 * 1024; // above this, Object Store
     o.LimitMarkerTtl = TimeSpan.FromSeconds(30); // delete-marker TTL on both KV buckets, >= 1 s
     o.MaxLeaseTtl = TimeSpan.FromSeconds(60);    // per-call LeaseTtl must not exceed it; _locks MaxAge = 2 x this
+    o.MinLeaseTtl = TimeSpan.FromSeconds(6);     // floor (v1.3): 3 x the 2 s request timeout, so one slow renewal ack cannot lose the lease
+    o.ShutdownTimeout = TimeSpan.FromSeconds(10); // DisposeAsync waits this long for lock-holding factories to write and release
     o.FailureMode = FailureMode.Open;            // default, overridable per call
     o.SchemaVersion = 1;                         // internal key suffix _s{n}; per type: o.ForType<Order>(2)
     o.KnownSchemaVersions = [1];                 // versions RemoveAsync deletes; add the previous one during a rolling deploy
@@ -218,7 +220,7 @@ services.AddNatsDistributedCache(o => {
 3. L2 `GetEntry` (Direct Get) on the internal key. Hit and logical expiry in the future → put into L1 with TTL = min(L1Ttl, remaining L2 life), jittered, but only if the entry's revision ≥ the key's high-water revision (section 7); if it is lower, re-read once from the stream leader, and if still lower return the newest value seen without filling L1 → return.
 4. Miss, logically expired (`entry.Created` + `x-cache-ttl` in the past, even if NATS has not removed it yet), or large-value object missing → remember the key's KV revision (or absent) and acquire the distributed lock (section 5).
     1. Won the lock → re-check L2 (double-checked; this revision is the fence's expected revision), run factory, fenced `Put` to L2, set L1, publish `set` notification, release lock.
-    2. Lost the lock → wait for the internal key's set, del or fail event on the notifications stream (plus 250 ms polling fallback) until `LockWaitTimeout`.
+    2. Lost the lock → wait for the internal key's set, del or fail event on the notifications stream (plus 250 ms polling fallback); the wait ends by the rules in section 5 (waiter behaviour).
 5. Return the value to every waiter on this node.
 
 ### Write path: `SetAsync`
@@ -252,17 +254,17 @@ A key's factory runs on exactly one node at a time: the node that wins the atomi
 | --- | --- | --- |
 | Acquire | TTL publish helper: publish a unique token (fresh per acquire) with `Nats-TTL` = LeaseTtl, expecting last subject sequence 0. On 10071, leader-read the last message: a tombstone (`KV-Operation: DEL` or `PURGE`) or a TTL marker (`Nats-Marker-Reason`) means free, so publish again expecting exactly that sequence; a live token means held (lost). A 10071 on the second publish is interpreted by the sequence in its text (`wrong last sequence: {seq}`): seq 0 (the marker expired meanwhile) → publish again expecting 0; seq > S → repeat the leader-read step (e.g. a MaxAge marker replaced the tombstone); a live token → lost, unless it is this acquire's own token (compared as bytes): that means an earlier send committed although its outcome was Unknown (lost reply, timeout or reconnect), so the node owns the lock, with the lease starting at that message's server time. An Unknown outcome from the helper is settled the same way, by a leader read. A 10037 (no message) from the leader read → publish expecting 0. At most 3 attempts, then lost | Never NATS.Net `CreateAsync` (changed in v1.1): on a tombstoned key it re-reads through Direct Get, and the spike measured 4.4–5.3 % spurious failures on uncontended keys on 2.12.15, each of which would make an idle node wait for a factory nobody runs. The helper acquire had 0 failures in 30 000+ cycles and was slightly faster. Atomic across the cluster via the stream leader; a release racing the second publish (nats-server #5162) can only produce a lost result, never two owners |
 | Token | `{nodeId}:{guid}:{unixMs}:{leaseMs}:{factoryTimeoutMs}` | Identifies the owner; carries the owner's LeaseTtl and FactoryTimeout so waiters cap their wait with the owner's values; logged for validation |
-| Lease TTL | `FactoryTimeout + 2 s` | Server-side per-key TTL, so a crashed owner's lock disappears by itself. Decided: this is only the default; LeaseTtl, FactoryTimeout and LockWaitTimeout can be overridden globally and per call. A per-call LeaseTtl above `MaxLeaseTtl` (default 60 s) throws; `_locks` MaxAge = 2 × MaxLeaseTtl |
-| Renew | TTL publish helper (key, token, expected revision, `Nats-TTL`) every `LeaseTtl / 3` | Done with the TTL publish helper (expected revision + `Nats-TTL`), never KV `UpdateAsync`, which would drop the TTL and leave a lock that never expires. Only for factories that run longer than one lease; stops if the revision check fails |
-| Release | DEL marker through the publish helper, expecting the owner's latest revision (the last renewal's, not the acquire's); it completes before the `fail` or `set` event is published, so waiters that retry on the event never see a live token | Only the current owner can release; a stale owner's release gets 10071 and is a no-op (spike-verified) |
+| Lease TTL | `FactoryTimeout + 2 s` | Server-side per-key TTL, so a crashed owner's lock disappears by itself. Decided: this is only the default; LeaseTtl, FactoryTimeout and LockWaitTimeout can be overridden globally and per call. The lease is clamped to [`MinLeaseTtl`, `MaxLeaseTtl`] (defaults 6 s and 60 s); an explicit LeaseTtl outside that range throws. The 6 s floor (v1.3) is 3 × the 2 s request timeout, so a single slow renewal ack cannot outlast the lease; `_locks` MaxAge = 2 × MaxLeaseTtl |
+| Renew | TTL publish helper (key, token, expected revision, `Nats-TTL`) every `LeaseTtl / 3` | Done with the TTL publish helper (expected revision + `Nats-TTL`), never KV `UpdateAsync`, which would drop the TTL and leave a lock that never expires. The first renewal is due at LeaseTtl / 3 after the acquire, so factories shorter than that never renew; renewal continues through the fenced write. Any outcome other than a commit is settled by a leader read (v1.3): our token at a newer revision = an earlier renewal landed late, adopt it; our token at the same revision = not extended (unknown outcome or a rejection such as a full bucket), retry within 250 ms without counting it as confirmed; anything else = lost, stop. Outages and unexpected errors are retried the same way while the last confirmed TTL still protects the lock; only when a full lease passes without a confirmed renewal is the lease lost. Renewal stops FactoryTimeout + LeaseTtl after the acquire (v1.3), so a factory that ignores its timeout hands the lock over through expiry instead of keeping it forever |
+| Release | DEL marker through the publish helper, expecting the owner's latest revision (the last renewal's, not the acquire's); it completes before the `fail` or `set` event is published, so waiters that retry on the event never see a live token. The caller's value is not held back by anything but the release itself, which is best effort within 5 s (v1.3) | Only the current owner can release; a stale owner's release gets 10071 and is a no-op (spike-verified), unless the head is still the owner's own token at a newer revision (a renewal that landed late), which is released once more. When the fenced write already failed because NATS is unreachable, the release is skipped and the lock expires with its lease. A failed release is never an error: the lease TTL is the fallback |
 | Wake waiters | Value lands in L2 plus a `set` notification | Woken via the notifications stream, not a per-key KV watch, for `{prefix}_cache/{internalKey}` and also poll every 250 ms as a fallback |
 
 ### Waiter behaviour
 
-1. Lose the acquire → register in the node's local waiter table (no new NATS consumer). The node's single notifications consumer wakes the waiter on the key's set, del or fail event; as a fallback it polls L2 and the lock key every 250 ms (decided).
+1. Lose the acquire → register in the node's local waiter table (no new NATS consumer). The node's single notifications consumer wakes the waiter on the key's set, del or fail event; as a fallback it polls L2 (Direct Get) and the lock key every 250 ms (decided). The lock key is polled through the leader (v1.3), so a lagging replica can neither hide a free lock nor keep showing a released one.
 2. Cache key gets a value → return it.
-3. Lock key deleted or expired without a value (owner failed or crashed) → retry acquire, with a small random backoff (10–50 ms) so waiters do not all hit the server at once.
-4. `LockWaitTimeout` reached → if the lock revision changed since the last check (the owner is renewing), keep waiting, but at most the owner's FactoryTimeout + LeaseTtl (read from the lock value) past the first observed lease revision; otherwise apply FailureMode (Q1): Open runs the factory locally (its result reaches L2 only through the fenced write) and the run is logged as a degraded window, Closed throws.
+3. Lock key deleted or expired without a value (owner failed or crashed) → retry acquire, with a small random backoff (10–50 ms) so waiters do not all hit the server at once. Winning it is a takeover: Reason = Takeover, `Attempt` = 1 + the number of distinct owners this waiter saw (so at least 2). After winning, the waiter does the same leader double-check as any owner, so a value written just before the release is returned without running the factory.
+4. `LockWaitTimeout` reached (changed in v1.3) → a live token on the lock key proves its owner renewed within one lease (the server TTL would have turned it into a marker otherwise), so keep waiting while one is held, up to the owner's bound: the owner's FactoryTimeout + 2 × LeaseTtl (read from the lock value) after first seeing that owner. An owner renews for at most FactoryTimeout + LeaseTtl and its lock is gone one lease later, so a well-behaved owner always frees the lock inside the bound and the waiter takes over through the lock. `LockWaitTimeout` is therefore the minimum wait, not the maximum. Only past both `LockWaitTimeout` and the owner's bound (an owner that keeps renewing against its own token, or a lock that cannot be acquired at all) does FailureMode apply (Q1): Open runs the factory locally (its result reaches L2 only through the fenced write) and the run is logged as a degraded window, Closed throws `CacheUnavailableException` naming the lock timeout. Token durations outside (0, 1 day] are ignored and the waiter's own values are used. The v1.2 rule ("keep waiting only if the lock revision changed") gave up on healthy owners whenever LeaseTtl / 3 exceeded LockWaitTimeout and has been removed.
 
 ### Failure cases
 
@@ -270,8 +272,10 @@ A key's factory runs on exactly one node at a time: the node that wins the atomi
 | --- | --- |
 | Factory throws | Release lock, publish `fail` notification so waiters retry immediately, do not cache (negative caching is Q5) |
 | Owner node crashes mid-factory | Lock expires after `LeaseTtl`; a waiter takes over. Worst-case added latency = `LeaseTtl` |
+| Factory ignores its FactoryTimeout | The owner stops renewing at FactoryTimeout + LeaseTtl; the lock expires one lease later and a waiter takes over through the lock (v1.3). The late result is fenced: the stale owner returns the newer value |
+| Owner shuts down gracefully mid-factory | `DisposeAsync` waits up to `ShutdownTimeout` (default 10 s) for lock-holding factories to finish the fenced write and release; the lock is never released under a running factory, so a shutdown cannot start a second execution. Leases still held after the timeout expire with their TTL. Waiters on the disposed node get `OperationCanceledException` |
 | Factory outlives lease without renew (GC pause, network partition) | A second owner can start: a double execution. Detected by the validator via factory counters and lock tokens; mitigated by renewals and by the fenced write (below), which rejects the stale owner's write when a newer value exists |
-| NATS unreachable | No lock possible; FailureMode applies (Q1): Open runs the factory locally with local single-flight only, Closed throws CacheUnavailableException |
+| NATS unreachable | No lock possible; FailureMode applies (Q1): Open runs the factory locally with local single-flight only, Closed throws CacheUnavailableException. The same applies when the locks bucket rejects an acquire for any reason other than a wrong last sequence (e.g. bucket missing or full; counted in `cache.lock.rejected`) |
 
 The guarantee we can honestly promise is "at most one factory execution per key per lease, as long as the owner renews in time". Truly exactly-once would need a consensus-backed fencing token checked by the data source, which is out of scope.
 
@@ -309,7 +313,7 @@ Server TTL grace (after review): the server-side `Nats-TTL` is `T_L2 + grace`, w
 
 ### Stampede protection beyond jitter (Q6)
 
-- Early refresh: when a read finds a value in its last 10 % of L2 life, one node (via the same lock) refreshes it in the background while everyone keeps getting the current value. Decided: `EarlyRefreshRatio` = 0.1 by default, 0 turns it off per call; the refresh uses the same lock and write fencing. Refreshes are locally single-flighted, run with Reason = EarlyRefresh, and losing the lock is a no-op: the node keeps serving the current value and does not wait.
+- Early refresh: when a read finds a value in its last 10 % of L2 life, one node (via the same lock) refreshes it in the background while everyone keeps getting the current value. Decided: `EarlyRefreshRatio` = 0.1 by default, 0 turns it off per call; the refresh uses the same lock and write fencing. Refreshes are locally single-flighted, run with Reason = EarlyRefresh, and losing the lock is a no-op: the node keeps serving the current value and does not wait. Clarified in v1.3: only `GetOrCreateAsync` triggers a refresh (from an L1 hit or an L2 hit; `TryGetAsync` has no factory), and each L1 fill allows one refresh attempt per node, so a refresh that loses the lock or fails is retried only after L1 is refilled (at most `L1Ttl` later). A refresh that finds a newer live value at the leader after winning the lock does nothing.
 - Stale-while-revalidate: v2.
 
 Clock skew between nodes shifts logical expiry by the skew. We assume NTP-synced containers (skew < 100 ms); the validator measures it.
@@ -523,6 +527,9 @@ The Validator prints a table of invariants × scenarios with pass/fail and the o
 | — | Telemetry | Meter + ActivitySource in library, OTel in TestApi |
 | — | NATS version | Latest stable release only, currently 2.15.0 (v1.2); pin moves forward after the spike suite passes on the new release |
 | — | Lock acquire | Publish helper + leader read, never NATS.Net `CreateAsync` (v1.1, spike-verified) |
+| — | Lock wait | A live token means a live owner: waiters wait past `LockWaitTimeout` up to the owner's FactoryTimeout + 2 × LeaseTtl; owners stop renewing at FactoryTimeout + LeaseTtl (v1.3). The factory never runs without the lock except under FailureMode |
+| — | Lease bounds | `MinLeaseTtl` 6 s, `MaxLeaseTtl` 60 s (v1.3) |
+| — | Shutdown | Never release a lock under a running factory; wait `ShutdownTimeout` for owners (v1.3) |
 | — | JWT single-flight evidence | Counters only (I2), no overlap check |
 
 ### Risks
@@ -539,8 +546,8 @@ The Validator prints a table of invariants × scenarios with pass/fail and the o
 ### Milestones
 
 1. Done (Sep 30, 2026; `spike/RESULTS.md`). Spike on NATS 2.15.0 (current requirement), 2.14.7, 2.12.15 and 2.11.2: per-key TTL and delete markers on expiry; CAS against a marker revision; TTL timers resuming after a full restart on file storage; lock create/delete throughput on file-backed R3 at 0.5 CPU with the default `sync_interval`; Direct Get staleness under load; leader-read latency at 0.5 CPU; ordered consumer started below FirstSeq (silent skip?); meta-only watch delivering TTL markers; DEL through the publish helper; `Create` contention.
-2. Core library: L1/L2, jitter, key validation, bucket provisioning, unit tests.
-3. Distributed single-flight with leases, renewal, fencing; integration tests.
+2. Done (Oct 1, 2026). Core library: L1/L2, jitter, key validation, bucket provisioning, unit tests.
+3. Done (Oct 1, 2026; review 7). Distributed single-flight with leases, renewal, fencing, early refresh; integration tests (5 nodes racing on one key: one factory call; crashed owner taken over; renewal past the TTL; lost lease resolved by the fence).
 4. Invalidation stream, reconnect resume, degraded mode.
 5. TestApi, Origin, compose rig with CPU limits, Prometheus/Grafana.
 6. k6 K1–K8 and Validator with invariants I1–I8.
@@ -676,3 +683,40 @@ Verdict: freeze v1.2 after text edits; the protocol is unchanged. The spike was 
 | CI version gate | Low | Script checks `/varz` against the pin and refuses RC images |
 | Spike code: publish exception handling, timing-based owner check, token as string, raw leader read, loose gates, script robustness | High–Low | Rewritten: tri-state helper, sequence-interval mutual-exclusion check, byte comparison, `INatsJSStream.GetAsync`, assertions on watch order and latency, try/finally connection pool, trap cleanup, failing health wait, per-run results cleanup, three CPU samples |
 | Leader reads fail with no-response during an election (found by the new failover test) | New | Leader reads are retried like Unknown outcomes (section 3) |
+
+### v1.3: changes from milestone 3 (Oct 1, 2026)
+
+Milestone 3 implemented section 5 and early refresh. The implementation exposed lock-wait and renewal rules that broke the premise (one factory execution per key, only under the distributed lock) in edge cases; review 7 settled them.
+
+| Change | Detail |
+| --- | --- |
+| Lock-wait rule | A live token = a live owner; wait past `LockWaitTimeout` up to the owner's FactoryTimeout + 2 × LeaseTtl. Replaces "keep waiting only if the revision changed" |
+| Renewal cap | Owners stop renewing FactoryTimeout + LeaseTtl after the acquire, so a hung factory hands over through the lock |
+| Renewal outcomes | Settled by a leader read: late renewal adopted, unconfirmed renewal retried without counting, only someone else's message = lost |
+| Release | Best effort within 5 s; adopts a late renewal; skipped when NATS is unreachable |
+| Lease bounds | `MinLeaseTtl` = 6 s added |
+| Shutdown | `ShutdownTimeout` = 10 s; locks are never released under a running factory |
+| Lock key polling | Leader read |
+| Clarified | When renewals start, early-refresh triggers, `Attempt` for takeovers, `LockWaitTimeout` is a minimum |
+
+### Review 7: Fable, Oct 1 2026 (all findings accepted; v1.3 frozen)
+
+Scope: the milestone-3 code (`DistributedLock`, `NatsCache` lock path and early refresh) against sections 3–6 and the spike protocol. Verdict: acquire and release are a faithful port of the spike; the findings were about what is layered on top. All fixes were checked against the premise: none lets a factory run without the lock outside FailureMode, and none releases a lock under a running factory.
+
+| Finding | Severity | Change made |
+| --- | --- | --- |
+| Unexpected exceptions from renewal or release escaped through the lease's dispose and replaced the factory result | Medium | Release never throws; renewal retries any error while the last TTL protects the lock (not "lost at once", which would invite a takeover under a running factory) |
+| Release on the caller's critical path during an outage (about 22 s) | Medium | Release skipped when the fenced write found NATS unreachable; release budget 5 s |
+| Unconfirmed renewal counted as confirmed | Medium | `NotRenewed` outcome: retried within 250 ms, not counted |
+| Any non-10071 rejection of a renewal marked the lease lost and skipped the release | Medium | Only someone else's message at the head = lost |
+| Shutdown token read after dispose; leases not released on shutdown | Low–medium | Token cached; `DisposeAsync` waits `ShutdownTimeout` for owners instead of releasing under them |
+| Late renewal made the release a no-op | Low | Release adopts our own token at a newer revision |
+| Non-10071 acquire rejection reported as a generic outage | Low | Dedicated message and `cache.lock.rejected` |
+| Misleading Closed-mode message on a lock timeout | Low | Message names the lock timeout |
+| Token durations trusted | Low | Ignored outside (0, 1 day] |
+| Dead catch in token parsing; `L1Item` record equality over mutable state | Low | Removed; `L1Item` is a class |
+| D1: "revision changed" wait rule failed when LeaseTtl / 3 > LockWaitTimeout | Medium | Live-token rule plus renewal cap (section 5, waiter step 4) |
+| D2–D6: renewal start, release latency, `LockWaitTimeout` meaning, early-refresh triggers, `Attempt` | Low | Clarified in sections 4–6 |
+| D7: no lower bound on LeaseTtl | Low | `MinLeaseTtl` 6 s |
+| Test gaps: unknown renew/release outcomes, outage during renewal, release on double-check hit / factory timeout / outage, lost lease resolved by the fence, owner change, stale lock reads, dispose, a fake-only test, an unlocked list read, real-time negatives | — | Added (unit 82 → 121, integration 8 → 16); fake gains lost-delete-reply and unapplied-unknown-put hooks and locked snapshots; negatives now wait on an observable signal |
+

@@ -19,6 +19,13 @@ internal sealed class CacheMetrics : IDisposable
         L2Full = _meter.CreateCounter<long>("cache.l2_full");
         Degraded = _meter.CreateCounter<long>("cache.degraded");
         LargeValuesSkipped = _meter.CreateCounter<long>("cache.large_values_skipped");
+        LocksAcquired = _meter.CreateCounter<long>("cache.lock.acquired");
+        LockWaits = _meter.CreateCounter<long>("cache.lock.waits");
+        LockTakeovers = _meter.CreateCounter<long>("cache.lock.takeovers");
+        LockWaitTimeouts = _meter.CreateCounter<long>("cache.lock.wait_timeouts");
+        LeasesLost = _meter.CreateCounter<long>("cache.lock.leases_lost");
+        EarlyRefreshes = _meter.CreateCounter<long>("cache.early_refreshes");
+        LockRejected = _meter.CreateCounter<long>("cache.lock.rejected");
     }
 
     public Counter<long> L1Hits { get; }
@@ -29,6 +36,13 @@ internal sealed class CacheMetrics : IDisposable
     public Counter<long> L2Full { get; }
     public Counter<long> Degraded { get; }
     public Counter<long> LargeValuesSkipped { get; }
+    public Counter<long> LocksAcquired { get; }
+    public Counter<long> LockWaits { get; }
+    public Counter<long> LockTakeovers { get; }
+    public Counter<long> LockWaitTimeouts { get; }
+    public Counter<long> LeasesLost { get; }
+    public Counter<long> EarlyRefreshes { get; }
+    public Counter<long> LockRejected { get; }
 
     public void Dispose() => _meter.Dispose();
 }

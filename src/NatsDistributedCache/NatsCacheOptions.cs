@@ -37,6 +37,15 @@ public sealed class NatsCacheOptions
     /// <summary>Upper bound for any lease; the locks bucket MaxAge is twice this.</summary>
     public TimeSpan MaxLeaseTtl { get; set; } = TimeSpan.FromSeconds(60);
 
+    /// <summary>
+    /// Lower bound for any lease (design section 5): renewals run every LeaseTtl / 3 and each can take a 2 s request
+    /// timeout, so a shorter lease is lost on one slow ack. Default 6 s (3 × the request timeout); at least 1 s.
+    /// </summary>
+    public TimeSpan MinLeaseTtl { get; set; } = TimeSpan.FromSeconds(6);
+
+    /// <summary>How long DisposeAsync waits for factories that hold a distributed lock to finish and release it.</summary>
+    public TimeSpan ShutdownTimeout { get; set; } = TimeSpan.FromSeconds(10);
+
     /// <summary>MaxAge of the cache bucket: a safety net above any L2 TTL plus grace.</summary>
     public TimeSpan CacheMaxAge { get; set; } = TimeSpan.FromHours(24);
 

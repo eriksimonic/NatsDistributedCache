@@ -36,7 +36,10 @@ internal sealed class Expiration
         _random = random;
     }
 
-    /// <summary>Effective lease: min(FactoryTimeout + 2 s, MaxLeaseTtl) by default; an explicit value above MaxLeaseTtl throws.</summary>
+    /// <summary>
+    /// Effective lease: FactoryTimeout + 2 s clamped to [MinLeaseTtl, MaxLeaseTtl] by default; an explicit value
+    /// outside that range throws.
+    /// </summary>
     public TimeSpan LeaseTtl(CacheEntryOptions o)
     {
         if (o.LeaseTtl is { } explicitLease)
@@ -44,11 +47,14 @@ internal sealed class Expiration
             if (explicitLease <= TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(o.LeaseTtl), "LeaseTtl must be positive.");
             if (explicitLease > _options.MaxLeaseTtl)
                 throw new ArgumentOutOfRangeException(nameof(o.LeaseTtl), $"LeaseTtl {explicitLease} exceeds MaxLeaseTtl {_options.MaxLeaseTtl}.");
+            if (explicitLease < _options.MinLeaseTtl)
+                throw new ArgumentOutOfRangeException(nameof(o.LeaseTtl), $"LeaseTtl {explicitLease} is below MinLeaseTtl {_options.MinLeaseTtl}.");
             return explicitLease;
         }
 
         var lease = o.FactoryTimeout + TimeSpan.FromSeconds(2);
-        return lease < _options.MaxLeaseTtl ? lease : _options.MaxLeaseTtl;
+        if (lease > _options.MaxLeaseTtl) lease = _options.MaxLeaseTtl;
+        return lease < _options.MinLeaseTtl ? _options.MinLeaseTtl : lease;
     }
 
     /// <summary>

@@ -1,31 +1,32 @@
 # Handoff: NATS distributed cache
 
-Oct 1, 2026. Milestones 1 (spike) and 2 (core library) are done and committed on `main`. Next up is milestone 3, the distributed lock. The design is frozen at v1.2 in `docs/DESIGN.md`, the single source of truth.
+Oct 1, 2026. Milestones 1 (spike), 2 (core library) and 3 (distributed single-flight) are done and committed on `main`. Next up is milestone 4, invalidation. The design is frozen at v1.3 in `docs/DESIGN.md`, the single source of truth.
 
 ## State at a glance
 
 | Milestone (DESIGN.md §12) | Status | Where |
 | --- | --- | --- |
 | 1. Spike: NATS behaviour the design relies on | Done, committed (`74209b3`) | `spike/`, results in `spike/RESULTS.md` |
-| 2. Core library: L1/L2, jitter, keys, provisioning, unit tests | Done, committed | `src/`, `tests/` |
-| 3. Distributed single-flight: leases, renewal, fencing, integration tests | Next | — |
-| 4. Invalidation stream, reconnect resume, degraded-mode journal | To do | — |
+| 2. Core library: L1/L2, jitter, keys, provisioning, unit tests | Done, committed (`7e0aae4`) | `src/`, `tests/` |
+| 3. Distributed single-flight: leases, renewal, fencing, early refresh, integration tests | Done, reviewed (review 7), committed | `Internal/DistributedLock.cs`, `NatsCache.cs`, lock tests |
+| 4. Invalidation stream, reconnect resume, degraded-mode journal | Next | — |
 | 5. TestApi, Origin, compose rig with CPU limits, Prometheus/Grafana | To do | — |
 | 6. k6 K1–K8 and Validator (I1–I8) | To do | — |
 | 7. Chaos C1–C8, tuning, v1.0 | To do | — |
 
-Test status: 82 unit tests and 8 integration tests (real NATS 2.15.0 via Testcontainers) pass. The solution builds for netstandard2.1 and net10.0 with warnings as errors.
+Test status: 121 unit tests and 16 integration tests (real NATS 2.15.0 via Testcontainers) pass, stable over repeated runs. The solution builds for netstandard2.1 and net10.0 with warnings as errors.
 
 ## Repo layout
 
 ```
-docs/DESIGN.md        design v1.2 (frozen); §13 logs six Fable reviews and the spike-driven changes
+docs/DESIGN.md        design v1.3 (frozen); §13 logs seven Fable reviews and the spike- and milestone-3-driven changes
 docs/HANDOFF.md       this file
 spike/                milestone-1 spike: Program.cs (14 checks), compose rig, run-spike.sh, RESULTS.md
 src/NatsDistributedCache/             core library (netstandard2.1 + net10.0)
   NatsCache.cs                        facade: read path, fenced writes, failure modes, background provisioning
   INatsCache.cs, CacheTypes.cs, CacheEntryOptions.cs, NatsCacheOptions.cs, Serialization.cs   public API
-  Internal/NatsL2Store.cs             L2 over NATS: publish helper (Committed/Rejected/Unknown), Direct Get, leader read
+  Internal/NatsL2Store.cs             L2 over NATS: publish helper (Committed/Rejected/Unknown), Direct Get, leader read; used for _cache and _locks
+  Internal/DistributedLock.cs         LockToken, DistributedLock (acquire/renew/release), LockLease (renewal loop, cap, best-effort release)
   Internal/L2.cs                      IL2Store abstraction, L2Entry, WriteResult
   Internal/L1Store.cs                 MemoryCache wrapper: compare-on-revision, revision floors, prefix floors
   Internal/Expiration.cs              jitter, Nats-TTL grace, lease default/cap
@@ -42,8 +43,8 @@ tests/NatsDistributedCache.IntegrationTests/  xUnit v3 + Testcontainers, single 
 
 ```bash
 dotnet build NatsDistributedCache.slnx                       # both TFMs, warnings as errors
-dotnet run --project tests/NatsDistributedCache.UnitTests        # 82 tests, < 1 s
-dotnet run --project tests/NatsDistributedCache.IntegrationTests # 8 tests, ~6 s, needs Docker
+dotnet run --project tests/NatsDistributedCache.UnitTests        # 121 tests, ~9 s (fake time drives the lock waits)
+dotnet run --project tests/NatsDistributedCache.IntegrationTests # 16 tests, ~13 s, needs Docker
 spike/run-spike.sh                                            # full spike on nats:2.15.0-alpine, ~4 min, needs Docker
 ```
 
@@ -52,7 +53,9 @@ The xUnit v3 test projects are executables (`dotnet run`); `dotnet test` also wo
 ## How milestone 2 maps to the design
 
 - **Read path** (§4): `NatsCache.GetOrCreateAsync` → `TryL1` → `SingleFlight.RunAsync` → `LoadAsync`: a Direct Get that re-reads through the leader when below the key's floor (`ReadAboveFloorAsync`), then a leader double-check, then the factory, then `WriteFencedAsync`.
-- **Where milestone 3 plugs in**: `NatsCache.LoadAsync` has a comment "Milestone 3 takes the distributed lock here", between the Direct Get miss and the leader double-check. The lease protocol is in DESIGN.md §5 and the spike's `HelperAcquire` / `HelperRelease` (`spike/Spike/Program.cs`), which review 6 judged fit to carry over.
+- **Distributed lock** (§5): `LoadAsync` takes the lock after the Direct Get miss (`DistributedLock.TryAcquireAsync`, a port of the spike's `HelperAcquire`), then does the leader double-check, runs the factory with renewal every LeaseTtl / 3, writes fenced, and releases in `finally` (`EndLeaseAsync`). Losers run `WaitForOwnerAsync`: 250 ms polls of L2 (Direct Get) and the lock key (leader read), takeover when the lock is free, the v1.3 live-token rule at `LockWaitTimeout`, then FailureMode.
+- **Early refresh** (§6): `L1Item.RefreshAt` marks the last `EarlyRefreshRatio` of L2 life; `MaybeRefresh` claims it once per L1 fill and runs `RefreshAsync` in the background (lock or no-op).
+- **Shutdown**: `DisposeAsync` cancels waiters, then waits up to `ShutdownTimeout` for `_activeLeases` to drain; it never releases a lock under a running factory.
 - **Fence rule** (§5): `WriteFencedAsync`. Empty, marker, purge or logically expired head = retry with its revision; DEL = return the result uncached; live newer = return it; Unknown = settle by the `Nats-Msg-Id` at the head of the subject; at most 3 attempts.
 - **Logical expiry**: server `Created` + `x-cache-ttl` header (ms), never the writer's clock (`TryUse`).
 - **Failure modes** (Q1/Q2): `L2UnavailableException` from the L2 store → Open runs the factory locally (`FactoryReason.Degraded`) and fills L1 only; Closed throws `CacheUnavailableException`. `UpdateAsync` (CAS) always throws when NATS is down.
@@ -63,12 +66,12 @@ The xUnit v3 test projects are executables (`dotnet run`); `dotnet test` also wo
 - **Direct Get uses `INatsJSStream.GetDirectAsync`**, not the KV API, because NATS.Net `NatsKVEntry` exposes no headers and the design keeps metadata in headers. Sequence and time come from the `Nats-Sequence` / `Nats-Time-Stamp` reply headers (nanosecond timestamps are trimmed to 7 digits). A 404 status means absent.
 - **Leader reads use `INatsJSStream.GetAsync(StreamMsgGetRequest)`**, which exists in NATS.Net 3.3.0 even though it is missing from the XML docs. Error 10037 means absent.
 - **Not implemented yet, by milestone**:
-  - Milestone 3: distributed lock, renewal, waiters, early refresh. `EarlyRefreshRatio`, `LockWaitTimeout` and `LeaseTtl` are accepted but unused, apart from the grace and lease math.
   - Milestone 4: invalidation events (publish and consume), the HWM from events, the Open-mode outage journal with leader-read replay, and the StreamInfo / sequence-gap check.
   - Large values: values above `LargeValueThresholdBytes` are returned uncached and counted in `cache.large_values_skipped`. The `_objects` store is provisioned but unused.
   - `HybridCache` / `IDistributedCache` adapters (Q10), including the `d.` key namespace and the AddHybridCache warning.
   - Circuit breaker and resilience pipeline (§8). Today every call retries inside the L2 store, then degrades.
-- **Unit-test fake**: `FakeL2Store` models History 1, a global sequence, 10071 with the last sequence in the text, msg-id dedup, TTL → MaxAge marker → empty, DEL tombstones, stale Direct Gets, lost replies and outages. Keep it in sync with real NATS behaviour; anything new should be confirmed in the spike or the integration tests first.
+- **Milestone-3 limits until milestone 4**: waiters only poll (no `set`/`del`/`fail` events yet), so a takeover after an owner failure costs up to one 250 ms poll. When an owner's write is fenced by a delete (fenced-del), waiters find no value and run the factory themselves as a takeover; the `del` event in milestone 4 lets them return instead.
+- **Unit-test fake**: `FakeL2Store` models History 1, a global sequence, 10071 with the last sequence in the text, msg-id dedup, TTL → MaxAge marker → empty, DEL tombstones, stale Direct Gets, lost put and delete replies, unknown puts that never apply, rejections and outages. The cache tests use one fake for `_cache` and a second for `_locks`; lock waits run on `FakeTimeProvider` driven in small steps (`Drive` / `DriveFor`). Keep it in sync with real NATS behaviour; anything new should be confirmed in the spike or the integration tests first.
 
 ## NATS facts that cost real time (all spike-verified on 2.15.0)
 
@@ -88,12 +91,12 @@ The xUnit v3 test projects are executables (`dotnet run`); `dotnet test` also wo
 - Every design change gets an adversarial review by a subagent on the Fable model. The owner then asks for all findings to be applied, each round is logged in DESIGN.md §13, and a frozen doc gets a version bump.
 - NATS: latest stable release only (currently 2.15.0; the pin moves after the spike passes; never an RC). NATS.Net pinned at 3.3.0.
 - All NATS stores are file-backed; memory storage is never used.
-- Commits go straight to `main` (no branches so far), when the owner asks or after a design freeze.
+- The repo has a remote (`origin`, GitHub). Commit messages carry no attribution lines. Docs and the spike are committed and pushed along with the code. Ask the owner before committing or pushing.
 
-## Next steps (milestone 3)
+## Next steps (milestone 4)
 
-1. Port `HelperAcquire` / `HelperRelease` from the spike into `src/NatsDistributedCache/Internal/` as a `DistributedLock` over the `_locks` bucket, on `NatsL2Store`'s publish helper. Include the owner's LeaseTtl and FactoryTimeout in the token, renewal every LeaseTtl / 3, and release before the event.
-2. Wire the lock into `NatsCache.LoadAsync` at the marked spot. Waiters: poll L2 and the lock key every 250 ms until milestone 4 adds event wake-ups; bounded wait (owner's FactoryTimeout + LeaseTtl), then FailureMode. Add `FactoryReason.Takeover` when a waiter takes over an expired lease.
-3. Early refresh (§6): at 10 % remaining life, take the lock in the background; losing it is a no-op.
-4. Tests: unit (extend `FakeL2Store` with a locks bucket) and integration (multiple `NatsCache` instances racing on one key: exactly one factory call; owner crash → takeover after the lease).
-5. Run a Fable review of milestone 3 before freezing it, per the working agreement.
+1. Invalidation events (§7): publish `set` / `del` / `tag` / `fail` to `{prefix}.notify.{internalKey}` after the release (release first, then the event, §5); one ordered consumer per node; evict L1 by revision; raise the per-key and prefix high-water revisions.
+2. Wake lock waiters from the consumer (local waiter table) and keep the 250 ms poll as the fallback; return the uncached result to waiters on a fenced-del instead of a takeover.
+3. Reconnect resume: detect sequence gaps from `Metadata.Sequence.Stream` (an ordered consumer below `FirstSeq` silently skips); on a gap, flush L1.
+4. Open-mode outage journal with leader-read replay as fenced deletes (Q2, §8).
+5. Fable review of milestone 4 before freezing, per the working agreement.

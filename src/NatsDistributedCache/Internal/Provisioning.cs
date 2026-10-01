@@ -73,6 +73,9 @@ internal sealed class Provisioner
         if (o.LimitMarkerTtl < TimeSpan.FromSeconds(1)) throw new ArgumentOutOfRangeException(nameof(o.LimitMarkerTtl), "LimitMarkerTtl must be at least 1 s.");
         if (o.Replicas is < 1 or > 5) throw new ArgumentOutOfRangeException(nameof(o.Replicas), "Replicas must be 1..5.");
         if (o.MaxLeaseTtl <= TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(o.MaxLeaseTtl));
+        if (o.MinLeaseTtl < TimeSpan.FromSeconds(1) || o.MinLeaseTtl > o.MaxLeaseTtl)
+            throw new ArgumentOutOfRangeException(nameof(o.MinLeaseTtl), "MinLeaseTtl must be at least 1 s and at most MaxLeaseTtl.");
+        if (o.ShutdownTimeout < TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(o.ShutdownTimeout));
         if (o.SchemaVersion < 1) throw new ArgumentOutOfRangeException(nameof(o.SchemaVersion), "Schema versions start at 1.");
         if (o.KnownSchemaVersions.Any(v => v < 1)) throw new ArgumentOutOfRangeException(nameof(o.KnownSchemaVersions), "Schema versions start at 1.");
         if (string.IsNullOrWhiteSpace(o.NodeId)) throw new ArgumentException("NodeId must be set.", nameof(o.NodeId));

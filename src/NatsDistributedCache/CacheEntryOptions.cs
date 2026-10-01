@@ -17,10 +17,17 @@ public sealed record CacheEntryOptions
     /// <summary>Maximum time a factory may run.</summary>
     public TimeSpan FactoryTimeout { get; init; } = TimeSpan.FromSeconds(10);
 
-    /// <summary>Maximum time to wait for another node's factory.</summary>
+    /// <summary>
+    /// Minimum time to wait for another node's factory before FailureMode applies. While the lock holds a live token
+    /// the wait continues up to the owner's FactoryTimeout + 2 × LeaseTtl (design section 5), so this is not the
+    /// maximum wait.
+    /// </summary>
     public TimeSpan LockWaitTimeout { get; init; } = TimeSpan.FromSeconds(15);
 
-    /// <summary>Lock lease; default min(FactoryTimeout + 2 s, MaxLeaseTtl). A value above MaxLeaseTtl throws.</summary>
+    /// <summary>
+    /// Lock lease; default FactoryTimeout + 2 s, clamped to [MinLeaseTtl, MaxLeaseTtl]. An explicit value outside
+    /// that range throws.
+    /// </summary>
     public TimeSpan? LeaseTtl { get; init; }
 
     /// <summary>Hard expiry (e.g. a token's exp). When set, jitter only shortens TTLs.</summary>

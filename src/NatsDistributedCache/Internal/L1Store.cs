@@ -3,8 +3,37 @@ using Microsoft.Extensions.Caching.Memory;
 
 namespace NatsDistributedCache.Internal;
 
-/// <summary>One L1 entry: the deserialized value, its L2 revision and its jittered expiry.</summary>
-internal sealed record L1Item(object? Value, ulong Revision, DateTimeOffset ExpiresAt, long Size);
+/// <summary>
+/// One L1 entry: the deserialized value, its L2 revision, its jittered expiry and, when early refresh is on,
+/// the moment the value enters the last part of its L2 life (design section 6). A class, not a record: the
+/// refresh claim is mutable state that must not take part in equality.
+/// </summary>
+internal sealed class L1Item
+{
+    private int _refreshClaimed;
+
+    public L1Item(object? value, ulong revision, DateTimeOffset expiresAt, long size, DateTimeOffset? refreshAt = null)
+    {
+        Value = value;
+        Revision = revision;
+        ExpiresAt = expiresAt;
+        Size = size;
+        RefreshAt = refreshAt;
+    }
+
+    public object? Value { get; }
+
+    public ulong Revision { get; }
+
+    public DateTimeOffset ExpiresAt { get; }
+
+    public long Size { get; }
+
+    public DateTimeOffset? RefreshAt { get; }
+
+    /// <summary>True for the first caller only, so a hot key starts at most one early refresh per L1 fill.</summary>
+    public bool TryClaimRefresh() => Interlocked.Exchange(ref _refreshClaimed, 1) == 0;
+}
 
 /// <summary>
 /// In-process L1 (design sections 4 and 7). Every write compares revisions, so an older value never

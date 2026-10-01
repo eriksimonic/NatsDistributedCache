@@ -32,6 +32,15 @@ internal sealed class FakeL2Store : IL2Store
     /// <summary>Direct Gets return the subject's previous message (a lagging replica).</summary>
     public bool StaleDirectReads { get; set; }
 
+    /// <summary>Every write is rejected with this API error code (e.g. 10059 stream not found); 0 = off.</summary>
+    public int RejectWritesWith { get; set; }
+
+    /// <summary>The next put is not stored and reports Unknown (a send that never reached the leader).</summary>
+    public bool NextPutUnknownNotApplied { get; set; }
+
+    /// <summary>The next delete commits but reports Unknown (lost reply).</summary>
+    public bool NextDeleteLosesReply { get; set; }
+
     /// <summary>The next put commits but reports Unknown (lost reply).</summary>
     public bool NextPutLosesReply { get; set; }
 
@@ -65,8 +74,16 @@ internal sealed class FakeL2Store : IL2Store
         }
 
         var h = new Dictionary<string, string>(headers, StringComparer.OrdinalIgnoreCase);
+        if (NextPutUnknownNotApplied)
+        {
+            NextPutUnknownNotApplied = false;
+            var lost = new WriteResult(WriteStatus.Unknown, 0, 0, "NatsJSPublishNoResponseException", Guid.NewGuid().ToString("N"));
+            lock (_gate) Puts.Add((key, expected, lost, h, natsTtl));
+            return lost;
+        }
+
         var result = Append(key, payload, h, natsTtl, expected, L2Op.Put);
-        Puts.Add((key, expected, result, h, natsTtl));
+        lock (_gate) Puts.Add((key, expected, result, h, natsTtl));
         if (NextPutLosesReply && result.Status == WriteStatus.Committed)
         {
             NextPutLosesReply = false;
@@ -80,7 +97,14 @@ internal sealed class FakeL2Store : IL2Store
     {
         ThrowIfUnavailable();
         var h = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["KV-Operation"] = "DEL" };
-        return new(Append(key, [], h, null, expected, L2Op.Delete));
+        var result = Append(key, [], h, null, expected, L2Op.Delete);
+        if (NextDeleteLosesReply && result.Status == WriteStatus.Committed)
+        {
+            NextDeleteLosesReply = false;
+            return new(result with { Status = WriteStatus.Unknown, Seq = 0, Error = "NatsJSPublishNoResponseException" });
+        }
+
+        return new(result);
     }
 
     public async IAsyncEnumerable<string> ListKeysAsync(string filter, [EnumeratorCancellation] CancellationToken ct)
@@ -101,6 +125,12 @@ internal sealed class FakeL2Store : IL2Store
         }
     }
 
+    /// <summary>Test helper: a copy of <see cref="Puts"/> taken under the store's lock (background renewals append to it).</summary>
+    public List<(string Key, ulong? Expected, WriteResult Result, IReadOnlyDictionary<string, string> Headers, TimeSpan NatsTtl)> PutsSnapshot()
+    {
+        lock (_gate) return [.. Puts];
+    }
+
     /// <summary>Test helper: the current message for a key, after TTL processing.</summary>
     public L2Entry? Peek(string key)
     {
@@ -115,6 +145,7 @@ internal sealed class FakeL2Store : IL2Store
     {
         lock (_gate)
         {
+            if (RejectWritesWith != 0) return new(WriteStatus.Rejected, 0, RejectWritesWith, "rejected by test", "");
             Expire(key);
             headers.TryGetValue("Nats-Msg-Id", out var msgId);
             msgId ??= Guid.NewGuid().ToString("N");

@@ -7,15 +7,20 @@ public sealed class NatsCacheTests : IAsyncDisposable
 {
     private readonly FakeTimeProvider _time = new(new DateTimeOffset(2026, 9, 30, 12, 0, 0, TimeSpan.Zero));
     private readonly FakeL2Store _l2;
+    private readonly FakeL2Store _locks;
     private readonly List<NatsCache> _caches = [];
 
-    public NatsCacheTests() => _l2 = new FakeL2Store(_time);
+    public NatsCacheTests()
+    {
+        _l2 = new FakeL2Store(_time);
+        _locks = new FakeL2Store(_time);
+    }
 
     private NatsCache NewCache(Action<NatsCacheOptions>? configure = null, Func<CancellationToken, Task>? provision = null, string node = "node-1")
     {
         var o = new NatsCacheOptions { Prefix = "test", NodeId = node, CompressionThresholdBytes = 1024 };
         configure?.Invoke(o);
-        var cache = new NatsCache(o, _l2, provision, null, _time, null, new FixedRandom(0.5));
+        var cache = new NatsCache(o, _l2, _locks, provision, null, _time, null, new FixedRandom(0.5));
         _caches.Add(cache);
         return cache;
     }
@@ -36,7 +41,10 @@ public sealed class NatsCacheTests : IAsyncDisposable
         var v = await cache.GetOrCreateAsync("orders.1", Factory("a", c => ctx = c));
 
         Assert.Equal("a", v);
-        Assert.Equal(new FactoryContext("orders.1", FactoryReason.Miss, null, 1), ctx);
+        Assert.Equal(FactoryReason.Miss, ctx!.Reason);
+        Assert.Equal(1, ctx.Attempt);
+        Assert.StartsWith("node-1:", ctx.LockToken); // the factory runs under the distributed lock
+        Assert.Equal(L2Op.Delete, _locks.Peek("orders.1._s1")!.Op); // released after the write
         var put = Assert.Single(_l2.Puts);
         Assert.Equal("orders.1._s1", put.Key);
         Assert.Equal(0UL, put.Expected);

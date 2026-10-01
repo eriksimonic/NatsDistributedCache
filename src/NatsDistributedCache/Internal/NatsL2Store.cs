@@ -48,6 +48,11 @@ internal sealed class NatsL2Store : IL2Store
             {
                 return null; // no message on the subject
             }
+            catch (NatsJSApiException ex) when (ex.Error.ErrCode == 10059)
+            {
+                // Stream not found: the bucket was deleted (or never provisioned). FailureMode applies.
+                throw new L2UnavailableException($"L2 read of '{key}' failed: bucket '{_bucket}' does not exist.", ex);
+            }
             catch (Exception ex) when (IsTransport(ex) && attempt < 2)
             {
                 // Leader reads fail with no-response during an election (spike leader-failover test).
