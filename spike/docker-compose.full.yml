@@ -1,0 +1,6 @@
+# Full-size profile (design section 9): 1 CPU per NATS node instead of 0.5, same 10 ms CFS period.
+#   docker compose -f docker-compose.yml -f docker-compose.full.yml up -d
+services:
+  nats-1: { cpu_quota: 10000 }
+  nats-2: { cpu_quota: 10000 }
+  nats-3: { cpu_quota: 10000 }

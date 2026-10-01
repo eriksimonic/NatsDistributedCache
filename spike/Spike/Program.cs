@@ -543,7 +543,8 @@ async Task<TestResult> TtlOverwrite(INatsKVStore kv, INatsKVStore lk, INatsJSCon
 // mode "helper" = the design's helper acquire and release.
 async Task<TestResult> LockThroughput(string mode)
 {
-    const int workers = 16;
+    // SPIKE_WORKERS sets the closed-loop concurrency for the design section 9 sweep (8/16/32/64); default 16.
+    var workers = int.TryParse(Environment.GetEnvironmentVariable("SPIKE_WORKERS"), out var w0) && w0 > 0 ? w0 : 16;
     var duration = TimeSpan.FromSeconds(15);
     await using var pool = await ConnPool.Create(Connect, 3);
     var ctx = new List<(INatsJSContext Js, INatsKVStore Kv, INatsJSStream Stream)>();
