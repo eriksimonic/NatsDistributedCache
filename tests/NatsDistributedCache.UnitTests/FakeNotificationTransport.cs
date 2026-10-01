@@ -82,8 +82,12 @@ internal sealed class FakeNotificationTransport : INotificationTransport
         }
     }
 
-    /// <summary>The stream is deleted and created again: sequences restart and consumers die.</summary>
-    public void Recreate()
+    /// <summary>
+    /// The stream is deleted and created again: sequences restart. By default consumers die; with
+    /// <paramref name="dropConsumers"/> = false they stay attached, as the NATS.Net ordered consumer does when it
+    /// follows a recreated stream silently (integration-verified): no error, no sequence jump.
+    /// </summary>
+    public void Recreate(bool dropConsumers = true)
     {
         lock (_gate)
         {
@@ -91,7 +95,7 @@ internal sealed class FakeNotificationTransport : INotificationTransport
             _seq = 0;
             _first = 1;
             Created = Created.AddHours(1);
-            DropSubscribers();
+            if (dropConsumers) DropSubscribers();
         }
     }
 

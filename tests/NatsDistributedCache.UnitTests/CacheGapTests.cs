@@ -499,6 +499,20 @@ public sealed class CacheGapTests : IAsyncDisposable
     }
 
     [Fact]
+    public async Task Outage_write_replaces_a_cached_copy_so_the_node_reads_its_own_write()
+    {
+        var a = await Node("a");
+        await a.SetAsync("orders.1", "pre-outage");
+        Assert.True(ServesFromL1(a, "orders.1", "pre-outage"));
+        _l2.Unavailable = true;
+        _notify.Unavailable = true;
+
+        await a.SetAsync("orders.1", "outage-write"); // Open mode: L1 only, revision 0
+
+        Assert.Equal("outage-write", (await a.TryGetAsync<string>("orders.1")).Value);
+    }
+
+    [Fact]
     public async Task Recovery_loop_probes_once_per_second_and_stops_after_recovering()
     {
         var a = await Node("a");
@@ -622,6 +636,21 @@ public sealed class CacheGapTests : IAsyncDisposable
         _notify.Append("test.notify." + Key, new CacheEvent(EventOp.Set, Key, 99, "x", 0).Encode());
         _notify.Append("test.notify.other._s1", new CacheEvent(EventOp.Set, "other._s1", 100, "x", 0).Encode());
         _notify.Append("test.notify.other._s1", new CacheEvent(EventOp.Set, "other._s1", 101, "x", 0).Encode());
+
+        await Eventually(() => !ServesFromL1(b, "orders.1", "v1"), "b flushed L1");
+    }
+
+    [Fact]
+    public async Task Stream_recreated_under_a_live_consumer_is_found_by_the_position_check()
+    {
+        var fast = (Action<NatsCacheOptions>)(o => o.NotificationsCheckInterval = TimeSpan.FromMilliseconds(100));
+        var a = await Node("a", fast);
+        var b = await Node("b", fast);
+        await a.SetAsync("orders.1", "v1");
+        await b.TryGetAsync<string>("orders.1");
+        await Eventually(() => b.LastEventSeen == 1, "b applied the event");
+
+        _notify.Recreate(dropConsumers: false); // the consumer neither fails nor sees a jump
 
         await Eventually(() => !ServesFromL1(b, "orders.1", "v1"), "b flushed L1");
     }

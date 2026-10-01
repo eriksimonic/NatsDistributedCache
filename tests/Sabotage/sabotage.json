@@ -425,5 +425,25 @@
     "expect": [
       "Events_go_to_the_key_tag_and_clear_subjects"
     ]
+  },
+  {
+    "id": "outage-write-keeps-cached-copy",
+    "rule": "§8 Open mode: a node reads its own outage write even when it had the key cached",
+    "file": "src/NatsDistributedCache/NatsCache.cs",
+    "find": "        _l1.Evict(ik, 0, TimeSpan.Zero);\n        if (value is null && o.CacheNullFor is null) return;",
+    "replace": "        if (value is null && o.CacheNullFor is null) return;",
+    "expect": [
+      "Outage_write_replaces_a_cached_copy_so_the_node_reads_its_own_write"
+    ]
+  },
+  {
+    "id": "no-position-check",
+    "rule": "§7 rule 7: a periodic position check finds a stream recreated under a live consumer",
+    "file": "src/NatsDistributedCache/Internal/NotificationListener.cs",
+    "find": "_watch ??= Task.Run(() => WatchAsync(_stop.Token));",
+    "replace": "_watch ??= Task.CompletedTask;",
+    "expect": [
+      "Stream_recreated_under_a_live_consumer_is_found_by_the_position_check"
+    ]
   }
 ]

@@ -93,7 +93,7 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
         _provision = provision ?? (_ => Task.CompletedTask);
         _journal = new OutageJournal(options.OutageJournalCapacity);
         _notify = notify;
-        if (notify is not null) _listener = new NotificationListener(notify, HandleEvent, FlushAfterLostEvents, _logger);
+        if (notify is not null) _listener = new NotificationListener(notify, HandleEvent, FlushAfterLostEvents, _logger, options.NotificationsCheckInterval);
     }
 
     /// <summary>True once the NATS stores are provisioned and verified.</summary>
@@ -838,8 +838,13 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
         _l1.RaiseFloor(ik, revision, FloorTtl(o));
     }
 
+    /// <summary>
+    /// An outage value (revision 0) replaces whatever L1 holds for the key: compare-on-revision would otherwise keep a
+    /// cached pre-outage copy and the node would not see its own write. Recovery flushes L1 again (section 8).
+    /// </summary>
     private void DegradedFill<T>(string ik, T value, CacheEntryOptions o)
     {
+        _l1.Evict(ik, 0, TimeSpan.Zero);
         if (value is null && o.CacheNullFor is null) return;
         var now = _time.GetUtcNow();
         var ttl = _expiration.PlanL1(o, now, now + (value is null ? o.CacheNullFor!.Value : o.L2Ttl));

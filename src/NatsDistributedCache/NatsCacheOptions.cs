@@ -80,6 +80,12 @@ public sealed class NatsCacheOptions
     /// <summary>Upper bound on keys and prefixes journaled while NATS is down (Open mode); beyond it L1 is still flushed on recovery.</summary>
     public int OutageJournalCapacity { get; set; } = 100_000;
 
+    /// <summary>
+    /// How often each node checks the notifications stream's position (design section 7, rule 7): catches a deleted
+    /// and recreated stream, which the ordered consumer follows silently. Internal until the v1.4 design pass.
+    /// </summary>
+    internal TimeSpan NotificationsCheckInterval { get; set; } = TimeSpan.FromSeconds(5);
+
     /// <summary>Overrides the schema version for values of type <typeparamref name="T"/>.</summary>
     public NatsCacheOptions ForType<T>(int schemaVersion)
     {

@@ -85,7 +85,8 @@ internal sealed class NatsNotificationTransport : INotificationTransport
 /// sequence jumps by more than 1, it reads StreamInfo: a recreated stream, <c>FirstSeq &gt; lastSeen + 1</c> or
 /// <c>LastSeq &lt; lastSeen</c> means events were lost (MaxAge / MaxMsgs discard, or an ordered consumer that silently
 /// skipped ahead), so it flushes L1 and resumes after the stream's current last sequence; otherwise it resumes from
-/// <c>lastSeen + 1</c>.
+/// <c>lastSeen + 1</c>. A position check every <c>checkInterval</c> covers what the consumer cannot see: a deleted and
+/// recreated stream, which the NATS.Net ordered consumer follows silently from the old position (no error, no jump).
 /// </summary>
 internal sealed class NotificationListener : IAsyncDisposable
 {
@@ -95,20 +96,24 @@ internal sealed class NotificationListener : IAsyncDisposable
     private readonly Action<CacheEvent> _handle;
     private readonly Action<string> _flush;
     private readonly ILogger _logger;
+    private readonly TimeSpan _checkInterval;
     private readonly CancellationTokenSource _stop = new();
     private readonly TaskCompletionSource<bool> _live = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private CancellationTokenSource? _current;
     private Task? _loop;
+    private Task? _watch;
     private ulong? _lastSeen;
     private DateTimeOffset? _created;
     private volatile bool _checkPending;
 
-    public NotificationListener(INotificationTransport transport, Action<CacheEvent> handle, Action<string> flush, ILogger logger)
+    public NotificationListener(INotificationTransport transport, Action<CacheEvent> handle, Action<string> flush, ILogger logger,
+        TimeSpan? checkInterval = null)
     {
         _transport = transport;
         _handle = handle;
         _flush = flush;
         _logger = logger;
+        _checkInterval = checkInterval ?? TimeSpan.FromSeconds(5);
         _transport.Reconnected += OnReconnected;
     }
 
@@ -119,16 +124,21 @@ internal sealed class NotificationListener : IAsyncDisposable
 
     public long Gaps { get; private set; }
 
-    public void Start() => _loop ??= Task.Run(() => RunAsync(_stop.Token));
+    public void Start()
+    {
+        _loop ??= Task.Run(() => RunAsync(_stop.Token));
+        _watch ??= Task.Run(() => WatchAsync(_stop.Token));
+    }
 
     public async ValueTask DisposeAsync()
     {
         _transport.Reconnected -= OnReconnected;
         _stop.Cancel();
         _current?.Cancel();
-        if (_loop is { } loop)
+        foreach (var task in new[] { _loop, _watch })
         {
-            try { await loop.ConfigureAwait(false); }
+            if (task is null) continue;
+            try { await task.ConfigureAwait(false); }
             catch (OperationCanceledException) { }
         }
 
@@ -141,6 +151,35 @@ internal sealed class NotificationListener : IAsyncDisposable
         _checkPending = true;
         try { _current?.Cancel(); } // restart the consumer through the gap check
         catch (ObjectDisposedException) { }
+    }
+
+    /// <summary>
+    /// Periodic position check: a changed creation time, a last sequence below the processed one, or discarded events
+    /// that were never processed restart the consumer through the gap check, which flushes L1.
+    /// </summary>
+    private async Task WatchAsync(CancellationToken stop)
+    {
+        while (!stop.IsCancellationRequested)
+        {
+            try
+            {
+                await Task.Delay(_checkInterval, stop).ConfigureAwait(false);
+                if (_lastSeen is not { } last || _created is not { } created) continue;
+                var pos = await _transport.PositionAsync(stop).ConfigureAwait(false);
+                if (pos.Created == created && pos.LastSeq >= last && pos.FirstSeq <= last + 1) continue;
+                _checkPending = true;
+                try { _current?.Cancel(); }
+                catch (ObjectDisposedException) { }
+            }
+            catch (OperationCanceledException) when (stop.IsCancellationRequested)
+            {
+                return;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Notifications position check failed; retrying");
+            }
+        }
     }
 
     private async Task RunAsync(CancellationToken stop)
