@@ -4,9 +4,11 @@ namespace NatsDistributedCache.Internal;
 
 /// <summary>
 /// Keys (and tag prefixes) this node wrote L1-only while NATS was unreachable in Open mode (design Q2, section 8
-/// recovery step 2), each with the time of its first outage write. On recovery every journaled key is re-read
+/// recovery step 2), each with the time of its last outage write. On recovery every journaled key is re-read
 /// through the leader and deleted at that revision when the L2 entry predates the outage write (minus a 1 s skew
-/// margin), so no node keeps serving the pre-outage value.
+/// margin), so no node keeps serving the pre-outage value. The latest time is the right fence (review 8): an entry
+/// another node wrote between two of this node's outage writes is older than the last one, and deleting a cache
+/// entry is always safe.
 /// </summary>
 internal sealed class OutageJournal
 {
@@ -35,7 +37,7 @@ internal sealed class OutageJournal
         return (keys, prefixes, overflowed);
     }
 
-    /// <summary>Puts entries back after a replay that NATS interrupted, keeping the earliest write time.</summary>
+    /// <summary>Puts entries back after a replay that failed, keeping the latest write time.</summary>
     public void Restore(IEnumerable<KeyValuePair<string, DateTimeOffset>> keys, IEnumerable<KeyValuePair<string, DateTimeOffset>> prefixes)
     {
         foreach (var k in keys) Record(_keys, k.Key, k.Value);
@@ -50,6 +52,6 @@ internal sealed class OutageJournal
             return;
         }
 
-        map.AddOrUpdate(key, at, (_, existing) => existing < at ? existing : at);
+        map.AddOrUpdate(key, at, (_, existing) => existing > at ? existing : at);
     }
 }

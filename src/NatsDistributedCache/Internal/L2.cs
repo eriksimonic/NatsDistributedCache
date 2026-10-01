@@ -59,6 +59,9 @@ internal sealed class L2UnavailableException : Exception
         : base(message, inner)
     {
     }
+
+    /// <summary>The stores are not provisioned yet: the node is not ready, which is not an outage (review 8).</summary>
+    public bool NotProvisioned { get; init; }
 }
 
 /// <summary>The KV bucket as the cache sees it (design section 3). Implemented over NATS and faked in unit tests.</summary>

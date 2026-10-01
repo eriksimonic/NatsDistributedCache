@@ -115,6 +115,28 @@ public sealed class OutageIntegrationTests(PausableNatsFixture nats) : IClassFix
     }
 
     [Fact]
+    public async Task Tag_delete_during_an_outage_is_replayed_on_recovery()
+    {
+        var a = await NodeAsync("a");
+        var b = await NodeAsync("b");
+        await b.SetAsync("orders.42.lines", "pre-outage");
+        await b.SetAsync("orders.42.head", "pre-outage");
+        await Task.Delay(1_500); // past the 1 s skew margin
+
+        await nats.PauseAsync();
+        await a.RemoveByTagAsync("orders.42"); // Open mode: evicted locally, prefix journaled
+        await nats.UnpauseAsync();
+        await Eventually(() => a.Health == CacheHealth.Healthy, "a recovered");
+
+        var l2 = new NatsL2Store(new NatsJSContext(await ConnectAsync()), $"{_prefix}_cache");
+        foreach (var key in new[] { "orders.42.lines._s1", "orders.42.head._s1" })
+        {
+            var head = await l2.ReadAsync(key, leader: true, default);
+            Assert.True(head is null || head.Op == L2Op.Delete, $"{key} still {head?.Op}");
+        }
+    }
+
+    [Fact]
     public async Task Readiness_check_goes_degraded_during_an_outage_and_healthy_again()
     {
         var builder = Host.CreateApplicationBuilder();

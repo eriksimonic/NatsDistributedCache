@@ -25,6 +25,7 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
 
     private const int MaxFenceAttempts = 3;
     internal static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(250);
+    private const int MaxWaiterFailures = 2; // consecutive L2 errors a waiter rides out before FailureMode applies
     private static readonly TimeSpan ReadyWait = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan RecoveryProbeInterval = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan OutageSkewMargin = TimeSpan.FromSeconds(1);
@@ -56,6 +57,7 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
     private volatile bool _ready;
     private volatile Exception? _fatal;
     private volatile bool _outage;
+    private int _outageWrites; // 1 once this node filled L1 with an outage value; recovery then flushes L1
     private DateTimeOffset _outageSince;
     private int _disposed;
 
@@ -203,11 +205,12 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
         }
         catch (L2UnavailableException ex)
         {
-            EnterOutage(ex);
-            ThrowIfClosed(o, ex);
-            // Open mode: L1 only; journaled and replayed as a fenced delete on recovery (section 8).
+            if (IsClosed(o)) FailClosed(o, ex);
+            // Open mode: L1 only; journaled and replayed as a fenced delete on recovery (section 8). Journal and L1
+            // first, then the outage flag, so a recovery that ends meanwhile still finds the entry (review 8).
             _journal.RecordKey(ik, _time.GetUtcNow());
             DegradedFill(ik, value, o);
+            EnterOutage(ex);
         }
     }
 
@@ -273,11 +276,11 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
         }
         catch (L2UnavailableException ex)
         {
-            EnterOutage(ex);
             foreach (var v in versions) _l1.Evict(CacheKeys.Internal(key, v), 0, TimeSpan.Zero);
-            ThrowIfClosed(null, ex);
+            if (IsClosed(null)) FailClosed(null, ex);
             var now = _time.GetUtcNow();
             foreach (var v in versions) _journal.RecordKey(CacheKeys.Internal(key, v), now);
+            EnterOutage(ex);
         }
     }
 
@@ -304,10 +307,10 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
         }
         catch (L2UnavailableException ex)
         {
-            EnterOutage(ex);
             _l1.EvictPrefix($"{prefix}.", 0, TimeSpan.Zero);
-            ThrowIfClosed(null, ex);
+            if (IsClosed(null)) FailClosed(null, ex);
             _journal.RecordPrefix(prefix, _time.GetUtcNow());
+            EnterOutage(ex);
         }
     }
 
@@ -481,10 +484,15 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
             catch (L2UnavailableException ex)
             {
                 lease?.Abandon(); // NATS is unreachable: skip the release (it would take as long to fail); the lease expires
-                EnterOutage(ex);
-                ThrowIfClosed(o, ex);
+                if (IsClosed(o)) FailClosed(o, ex);
                 DegradedFill(ik, value, o);
+                EnterOutage(ex);
                 result = new Fenced<T>(value, FactoryOutcome.LocalOnly, 0);
+            }
+            catch (Exception ex)
+            {
+                error = ex; // e.g. the serializer: the outcome hook reports the cause (review 8)
+                throw;
             }
 
             return result.Value.Value;
@@ -529,6 +537,7 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
         string? ownerText = null;
         var ownerBound = DateTimeOffset.MinValue;
         var owners = 0;
+        var failures = 0;
 
         void Observe(L2Entry? lk)
         {
@@ -550,17 +559,29 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
             {
                 await WaitForSignalOrPollAsync(signal).ConfigureAwait(false);
                 signal = _signals.Next(ik); // re-armed before reading, so an event during the reads is not missed
-                if (TryUse<T>(await ReadAboveFloorAsync(ik, CancellationToken.None).ConfigureAwait(false), o, out var value))
-                    return new(true, value, null, 0);
-
-                // Leader read: a lagging replica must not hide a free lock (or keep showing a released one).
-                var lk = await _lock.ReadAsync(ik, leader: true, CancellationToken.None).ConfigureAwait(false);
-                if (!DistributedLock.IsHeld(lk))
+                L2Entry? lk;
+                try
                 {
-                    await _time.DelayAsync(TimeSpan.FromMilliseconds(10 + 40 * _random.NextDouble()), _shutdownToken).ConfigureAwait(false);
-                    var r = await _lock.TryAcquireAsync(ik, leaseTtl, o.FactoryTimeout, CancellationToken.None).ConfigureAwait(false);
-                    if (r.Lease is not null) return new(false, default!, r.Lease, Math.Max(owners, 1) + 1);
-                    lk = r.Holder;
+                    if (TryUse<T>(await ReadAboveFloorAsync(ik, CancellationToken.None).ConfigureAwait(false), o, out var value))
+                        return new(true, value, null, 0);
+
+                    // Leader read: a lagging replica must not hide a free lock (or keep showing a released one).
+                    lk = await _lock.ReadAsync(ik, leader: true, CancellationToken.None).ConfigureAwait(false);
+                    if (!DistributedLock.IsHeld(lk))
+                    {
+                        await _time.DelayAsync(TimeSpan.FromMilliseconds(10 + 40 * _random.NextDouble()), _shutdownToken).ConfigureAwait(false);
+                        var r = await _lock.TryAcquireAsync(ik, leaseTtl, o.FactoryTimeout, CancellationToken.None).ConfigureAwait(false);
+                        if (r.Lease is not null) return new(false, default!, r.Lease, Math.Max(owners, 1) + 1);
+                        lk = r.Holder;
+                    }
+
+                    failures = 0;
+                }
+                catch (L2UnavailableException) when (++failures <= MaxWaiterFailures && _time.GetUtcNow() < (deadline > ownerBound ? deadline : ownerBound))
+                {
+                    // One transient error must not run a second factory beside a healthy owner (review 8): wait for the
+                    // next signal or poll and read again; degrade only when NATS keeps failing.
+                    continue;
                 }
 
                 Observe(lk);
@@ -731,6 +752,7 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
         }
 
         DegradedFill(ik, value, o);
+        EnterOutage(cause); // a no-op if already in the outage; starts recovery when the first call was "not provisioned yet"
         Report(new FactoryCompletion(key, FactoryReason.Degraded, null, 1, FactoryOutcome.LocalOnly, 0, startedAt, _time.GetUtcNow(), null));
         return value;
     }
@@ -844,6 +866,7 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
     /// </summary>
     private void DegradedFill<T>(string ik, T value, CacheEntryOptions o)
     {
+        Interlocked.Exchange(ref _outageWrites, 1);
         _l1.Evict(ik, 0, TimeSpan.Zero);
         if (value is null && o.CacheNullFor is null) return;
         var now = _time.GetUtcNow();
@@ -869,10 +892,18 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
 
     private string InternalKey<T>(string key) => CacheKeys.Internal(key, _options.SchemaVersionFor(typeof(T)));
 
+    private bool IsClosed(CacheEntryOptions? o) => (o?.FailureMode ?? _options.FailureMode) == FailureMode.Closed;
+
     private void ThrowIfClosed(CacheEntryOptions? o, Exception cause, string? message = null)
     {
-        if ((o?.FailureMode ?? _options.FailureMode) == FailureMode.Closed)
-            throw new CacheUnavailableException(message ?? "NATS is unavailable and FailureMode is Closed.", cause);
+        if (IsClosed(o)) throw new CacheUnavailableException(message ?? "NATS is unavailable and FailureMode is Closed.", cause);
+    }
+
+    /// <summary>Closed mode: mark the outage (readiness turns Unhealthy) and throw.</summary>
+    private void FailClosed(CacheEntryOptions? o, L2UnavailableException cause)
+    {
+        EnterOutage(cause);
+        ThrowIfClosed(o, cause);
     }
 
     // ------------------------------------------------------------------ invalidation events (section 7)
@@ -939,6 +970,9 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
     private void EnterOutage(Exception cause)
     {
         if (_disposed == 1) return;
+        // Stores not provisioned yet is "not ready", not an outage (review 8), unless the node already wrote L1-only:
+        // then recovery must replay and flush once the stores are there.
+        if (cause is L2UnavailableException { NotProvisioned: true } && _journal.IsEmpty && Volatile.Read(ref _outageWrites) == 0) return;
         lock (_startLock)
         {
             if (_outage) return;
@@ -969,7 +1003,17 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
             {
                 await EnsureReadyAsync(ct).ConfigureAwait(false);
                 await _l2.LastSequenceAsync(ct).ConfigureAwait(false);
-                if (await RecoverAsync(ct).ConfigureAwait(false)) return;
+                if (await RecoverAsync(ct).ConfigureAwait(false))
+                {
+                    // Exit under the lock writers take in EnterOutage: an outage raised after the recovery keeps this
+                    // loop running instead of finding a loop that is about to end (review 8).
+                    lock (_startLock)
+                    {
+                        if (_outage) continue;
+                        _recovery = null;
+                        return;
+                    }
+                }
             }
             catch (L2UnavailableException)
             {
@@ -995,9 +1039,16 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
     private async Task<bool> RecoverAsync(CancellationToken ct)
     {
         var (keys, prefixes, overflowed) = _journal.Drain();
-        _l1.Clear();
-        _signals.PulseAll();
-        _metrics.L1Flushes.Add(1, new KeyValuePair<string, object?>("reason", "recovery"));
+        // Flush only when this node holds outage values (L1-only writes) or journaled writes (review 8). Events missed
+        // during the outage are found by the notifications gap check (section 7, rule 7), so a transient error that
+        // wrote nothing costs no flush.
+        if (Interlocked.Exchange(ref _outageWrites, 0) == 1 || keys.Count > 0 || prefixes.Count > 0)
+        {
+            _l1.Clear();
+            _signals.PulseAll();
+            _metrics.L1Flushes.Add(1, new KeyValuePair<string, object?>("reason", "recovery"));
+        }
+
         var deleted = 0;
         var pending = new List<KeyValuePair<string, DateTimeOffset>>(keys);
         var pendingPrefixes = new List<KeyValuePair<string, DateTimeOffset>>(prefixes);
@@ -1026,14 +1077,23 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
             _journal.Restore(pending, pendingPrefixes);
             return false;
         }
+        catch
+        {
+            _journal.Restore(pending, pendingPrefixes); // any failure: never lose the unreplayed entries (review 8)
+            throw;
+        }
 
         if (overflowed)
             _logger.LogError("The outage journal overflowed ({Capacity} entries); some outage writes were not replayed and other nodes may serve pre-outage values until they expire", _options.OutageJournalCapacity);
         var duration = _time.GetUtcNow() - _outageSince;
-        lock (_startLock) _outage = false;
+        lock (_startLock)
+        {
+            if (!_journal.IsEmpty) return false; // written during the replay (NATS flapped): replay again at the next probe
+            _outage = false;
+        }
+
         _metrics.Recovered.Add(1);
-        _logger.LogInformation("NATS recovered after {Duration}; L1 flushed, {Deleted} outage write(s) replayed as fenced deletes", duration, deleted);
-        if (!_journal.IsEmpty) EnterOutage(new L2UnavailableException("writes journaled during the replay")); // NATS flapped
+        _logger.LogInformation("NATS recovered after {Duration}; {Deleted} outage write(s) replayed as fenced deletes", duration, deleted);
         return true;
     }
 
@@ -1060,7 +1120,7 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
         using var wait = CancellationTokenSource.CreateLinkedTokenSource(ct);
         var done = await Task.WhenAny(provisioning, Task.Delay(ReadyWait, wait.Token)).ConfigureAwait(false);
         wait.Cancel();
-        if (!_ready) throw new L2UnavailableException("Cache stores are not provisioned yet.", _fatal);
+        if (!_ready) throw new L2UnavailableException("Cache stores are not provisioned yet.", _fatal) { NotProvisioned = _fatal is null };
         _ = done;
     }
 

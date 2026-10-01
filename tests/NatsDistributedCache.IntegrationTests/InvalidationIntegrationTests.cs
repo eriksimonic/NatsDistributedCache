@@ -158,4 +158,78 @@ public sealed class InvalidationIntegrationTests(NatsFixture nats) : IAsyncLifet
         // The ordered consumer follows the new stream silently; the 5 s position check finds the new creation time.
         await Eventually(async () => await Read(b, "users.1") == "raw", "b flushed L1 after the stream was recreated", TimeSpan.FromSeconds(15));
     }
+
+    [Fact]
+    public async Task Node_that_has_processed_no_event_converges_after_a_reconnect()
+    {
+        var (a, _) = await NodeAsync("a");
+        await a.SetAsync("orders.1", "v1");
+        var (b, bConnection) = await NodeAsync("b"); // subscribed after the only event: has processed none
+        Assert.Equal("v1", await Read(b, "orders.1"));
+
+        var reconnect = bConnection.ReconnectAsync();
+        await a.SetAsync("orders.1", "v2");
+        await reconnect;
+
+        await Eventually(async () => await Read(b, "orders.1") == "v2", "b converged");
+    }
+}
+
+[CollectionDefinition(nameof(FlushCounting), DisableParallelization = true)]
+public sealed class FlushCounting;
+
+/// <summary>
+/// The flush counter is process-wide (every cache's meter shares one name), so this runs alone: other classes flush
+/// on purpose.
+/// </summary>
+[Collection(nameof(FlushCounting))]
+public sealed class SteadyStateIntegrationTests(NatsFixture nats) : IAsyncLifetime
+{
+    private readonly List<IAsyncDisposable> _disposables = [];
+    private readonly string _prefix = NatsFixture.NewPrefix();
+
+    public ValueTask InitializeAsync() => default;
+
+    public async ValueTask DisposeAsync()
+    {
+        for (var i = _disposables.Count - 1; i >= 0; i--) await _disposables[i].DisposeAsync();
+    }
+
+    private async Task<NatsCache> NodeAsync(string node)
+    {
+        var nc = await nats.ConnectAsync();
+        _disposables.Add(nc);
+        var cache = new NatsCache(new NatsCacheOptions { Prefix = _prefix, NodeId = node, Replicas = 1 }, nc);
+        _disposables.Add(cache);
+        cache.Start();
+        for (var i = 0; i < 100 && !cache.IsReady && cache.ProvisioningError is null; i++) await Task.Delay(100);
+        Assert.True(cache.IsReady, cache.ProvisioningError?.Message);
+        await cache.NotificationsLive.WaitAsync(TimeSpan.FromSeconds(5));
+        return cache;
+    }
+
+    [Fact]
+    public async Task Steady_writes_never_trigger_a_flush()
+    {
+        var a = await NodeAsync("a");
+        var b = await NodeAsync("b");
+        long flushes = 0;
+        using var listener = new System.Diagnostics.Metrics.MeterListener();
+        listener.InstrumentPublished = (instrument, l) =>
+        {
+            if (instrument.Meter.Name == "NatsDistributedCache" && instrument.Name == "cache.l1.flushes") l.EnableMeasurementEvents(instrument);
+        };
+        listener.SetMeasurementEventCallback<long>((_, value, _, _) => Interlocked.Add(ref flushes, value));
+        listener.Start();
+
+        var sw = Stopwatch.StartNew();
+        for (var i = 0; sw.Elapsed < TimeSpan.FromSeconds(12); i++) // more than two 5 s position checks
+        {
+            await a.SetAsync($"orders.{i % 50}", $"v{i}");
+            await b.TryGetAsync<string>($"orders.{i % 50}");
+            await Task.Delay(20);
+        }
+
+        Assert.Equal(0, Interlocked.Read(ref flushes));
+    }
 }

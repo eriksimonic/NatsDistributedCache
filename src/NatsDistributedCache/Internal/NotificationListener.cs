@@ -80,8 +80,10 @@ internal sealed class NatsNotificationTransport : INotificationTransport
 }
 
 /// <summary>
-/// One ordered consumer per node on <c>{prefix}.notify.&gt;</c> (design section 7, consumer rules). It starts at
-/// "new" on first boot and tracks the last processed stream sequence. After a reconnect, and whenever the delivered
+/// One ordered consumer per node on <c>{prefix}.notify.&gt;</c> (design section 7, consumer rules). On first subscribe it
+/// takes the stream's <c>LastSeq</c> as its position and consumes from the next sequence (review 8: a node that has not
+/// processed any event yet still has a position, so every gap check below applies to it); it then tracks the last
+/// processed stream sequence. After a reconnect, and whenever the delivered
 /// sequence jumps by more than 1, it reads StreamInfo: a recreated stream, <c>FirstSeq &gt; lastSeen + 1</c> or
 /// <c>LastSeq &lt; lastSeen</c> means events were lost (MaxAge / MaxMsgs discard, or an ordered consumer that silently
 /// skipped ahead), so it flushes L1 and resumes after the stream's current last sequence; otherwise it resumes from
@@ -99,6 +101,7 @@ internal sealed class NotificationListener : IAsyncDisposable
     private readonly TimeSpan _checkInterval;
     private readonly CancellationTokenSource _stop = new();
     private readonly TaskCompletionSource<bool> _live = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly object _gate = new(); // guards _lastSeen and _created, which the position check reads from another thread
     private CancellationTokenSource? _current;
     private Task? _loop;
     private Task? _watch;
@@ -120,7 +123,10 @@ internal sealed class NotificationListener : IAsyncDisposable
     /// <summary>Completes once the first consumer is subscribed (events published after this are seen).</summary>
     public Task Live => _live.Task;
 
-    public ulong? LastSeen => _lastSeen;
+    public ulong? LastSeen
+    {
+        get { lock (_gate) return _lastSeen; }
+    }
 
     public long Gaps { get; private set; }
 
@@ -147,7 +153,7 @@ internal sealed class NotificationListener : IAsyncDisposable
 
     private void OnReconnected()
     {
-        if (_lastSeen is null) return; // nothing processed yet: nothing to resume
+        if (LastSeen is null) return; // not subscribed yet: the first subscribe reads the position anyway
         _checkPending = true;
         try { _current?.Cancel(); } // restart the consumer through the gap check
         catch (ObjectDisposedException) { }
@@ -164,7 +170,14 @@ internal sealed class NotificationListener : IAsyncDisposable
             try
             {
                 await Task.Delay(_checkInterval, stop).ConfigureAwait(false);
-                if (_lastSeen is not { } last || _created is not { } created) continue;
+                ulong last;
+                DateTimeOffset created;
+                lock (_gate)
+                {
+                    if (_lastSeen is not { } l || _created is not { } c) continue;
+                    (last, created) = (l, c);
+                }
+
                 var pos = await _transport.PositionAsync(stop).ConfigureAwait(false);
                 if (pos.Created == created && pos.LastSeq >= last && pos.FirstSeq <= last + 1) continue;
                 _checkPending = true;
@@ -191,14 +204,23 @@ internal sealed class NotificationListener : IAsyncDisposable
             _current = current;
             try
             {
-                _created ??= (await _transport.PositionAsync(current.Token).ConfigureAwait(false)).Created;
+                if (_created is null)
+                {
+                    var pos = await _transport.PositionAsync(current.Token).ConfigureAwait(false);
+                    lock (_gate)
+                    {
+                        _created = pos.Created;
+                        _lastSeen ??= pos.LastSeq;
+                    }
+                }
+
                 if (_checkPending)
                 {
                     _checkPending = false;
                     await CheckGapAsync(current.Token).ConfigureAwait(false);
                 }
 
-                var start = _lastSeen is { } seen ? seen + 1 : (ulong?)null;
+                var start = _lastSeen + 1;
                 await foreach (var msg in _transport.ConsumeAsync(start, current.Token).ConfigureAwait(false))
                 {
                     if (msg.StreamSeq == 0)
@@ -220,7 +242,7 @@ internal sealed class NotificationListener : IAsyncDisposable
                     }
 
                     Dispatch(msg);
-                    _lastSeen = msg.StreamSeq;
+                    lock (_gate) _lastSeen = msg.StreamSeq;
                 }
             }
             catch (OperationCanceledException) when (stop.IsCancellationRequested)
@@ -229,7 +251,9 @@ internal sealed class NotificationListener : IAsyncDisposable
             }
             catch (OperationCanceledException)
             {
-                // a reconnect cancelled the current consumer; loop runs the gap check
+                // A reconnect or the position check cancelled the consumer: always run the gap check next, even if the
+                // cancel landed while a check was already running (review 8).
+                _checkPending = true;
             }
             catch (Exception ex)
             {
@@ -258,10 +282,13 @@ internal sealed class NotificationListener : IAsyncDisposable
         if (reason is null) return; // nothing lost: resume from lastSeen + 1
         _logger.LogWarning("Invalidation events were lost ({Reason}); flushing L1 and resuming after the stream's last sequence", reason);
         _flush(reason);
-        _created = pos.Created;
         // Everything up to LastSeq describes writes made before the flush, so nothing in the fresh L1 depends on it.
         // Resuming right after it (rather than from "new") leaves no window between the flush and the resubscribe.
-        _lastSeen = pos.LastSeq;
+        lock (_gate)
+        {
+            _created = pos.Created;
+            _lastSeen = pos.LastSeq;
+        }
     }
 
     private void Dispatch(DeliveredEvent msg)

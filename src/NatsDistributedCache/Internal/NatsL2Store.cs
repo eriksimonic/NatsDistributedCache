@@ -92,8 +92,29 @@ internal sealed class NatsL2Store : IL2Store
             throw new L2UnavailableException("L2 key listing failed.", ex);
         }
 
-        await foreach (var k in kv.GetKeysAsync([filter], cancellationToken: ct).ConfigureAwait(false))
-            yield return k;
+        // Errors while enumerating are mapped too (review 8): a raw NATS exception would bypass the outage path in
+        // RemoveByTagAsync and the journal restore in recovery.
+        var keys = kv.GetKeysAsync([filter], cancellationToken: ct).GetAsyncEnumerator(ct);
+        try
+        {
+            while (true)
+            {
+                try
+                {
+                    if (!await keys.MoveNextAsync().ConfigureAwait(false)) yield break;
+                }
+                catch (Exception ex) when (IsTransport(ex) || ex is NatsJSApiException)
+                {
+                    throw new L2UnavailableException("L2 key listing failed.", ex);
+                }
+
+                yield return keys.Current;
+            }
+        }
+        finally
+        {
+            await keys.DisposeAsync().ConfigureAwait(false);
+        }
     }
 
     public async ValueTask<ulong> LastSequenceAsync(CancellationToken ct)

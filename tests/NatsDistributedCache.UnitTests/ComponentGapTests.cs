@@ -91,7 +91,7 @@ public sealed class ComponentGapTests
         j.RecordKey("a", t0);
         j.RecordKey("b", t0);
         Assert.False(j.Overflowed);
-        j.RecordKey("a", t0.AddSeconds(5)); // known key at capacity: kept, earliest time wins
+        j.RecordKey("a", t0.AddSeconds(5)); // known key at capacity: kept, latest time wins
         Assert.False(j.Overflowed);
 
         j.RecordKey("c", t0);
@@ -100,18 +100,19 @@ public sealed class ComponentGapTests
         var (keys, _, overflowed) = j.Drain();
         Assert.True(overflowed);
         Assert.Equal(["a", "b"], keys.Keys.OrderBy(k => k));
-        Assert.Equal(t0, keys["a"]);
+        Assert.Equal(t0.AddSeconds(5), keys["a"]);
         Assert.False(j.Drain().Overflowed); // reset by the drain
     }
 
     [Fact]
-    public void Journal_keeps_the_earliest_write_whatever_the_order()
+    public void Journal_keeps_the_latest_write_whatever_the_order()
     {
         var t0 = _time.GetUtcNow();
         var j = new OutageJournal(10);
-        j.RecordKey("a", t0.AddSeconds(5));
         j.RecordKey("a", t0);
-        Assert.Equal(t0, j.Drain().Keys["a"]);
+        j.RecordKey("a", t0.AddSeconds(5));
+        j.RecordKey("a", t0.AddSeconds(2));
+        Assert.Equal(t0.AddSeconds(5), j.Drain().Keys["a"]);
     }
 
     // ------------------------------------------------------------------ L1Store

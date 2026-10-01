@@ -504,6 +504,7 @@ public sealed class CacheGapTests : IAsyncDisposable
         var a = await Node("a");
         await a.SetAsync("orders.1", "pre-outage");
         Assert.True(ServesFromL1(a, "orders.1", "pre-outage"));
+        await Eventually(() => a.LastEventSeen == 1, "a applied its own set event"); // a late one evicts a revision-0 value
         _l2.Unavailable = true;
         _notify.Unavailable = true;
 
@@ -528,13 +529,16 @@ public sealed class CacheGapTests : IAsyncDisposable
         _l2.Unavailable = false;
         await AdvanceUntil(() => a.Health == CacheHealth.Healthy, TimeSpan.FromSeconds(1), "recovered");
         await a.SetAsync("orders.1", "v");
+        await Task.Delay(50);
+        var probes = _l2.LastSequenceCalls;
         for (var i = 0; i < 3; i++)
         {
             _time.Advance(TimeSpan.FromSeconds(1));
             await Task.Delay(30);
         }
 
-        Assert.True(ServesFromL1(a, "orders.1", "v")); // the loop ended: no more recovery flushes
+        Assert.Equal(probes, _l2.LastSequenceCalls); // the loop ended: no more probes against a healthy NATS
+        Assert.True(ServesFromL1(a, "orders.1", "v"));
     }
 
     // ------------------------------------------------------------------ provisioning, validation, shutdown

@@ -193,8 +193,9 @@ internal sealed class L1Store : IDisposable
 
     public void Clear()
     {
+        // Values only: per-key and prefix floors survive a flush and expire on their own. A tag-deleted key has no per-key
+        // floor on other nodes, so its prefix floor is all that stops a lagging replica refilling it (review 8, I5).
         foreach (var key in _keys.Keys.ToList()) _cache.Remove(key);
-        _prefixFloors.Clear();
     }
 
     public void Dispose() => _cache.Dispose();

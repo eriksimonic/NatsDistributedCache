@@ -47,6 +47,15 @@ internal sealed class FakeL2Store : IL2Store
     /// <summary>Runs before each put is applied; lets a test inject a concurrent write.</summary>
     public Func<string, Task>? BeforePut { get; set; }
 
+    /// <summary>One-shot hook run before a delete (e.g. to interleave a write with a recovery replay).</summary>
+    public Func<string, Task>? BeforeDelete { get; set; }
+
+    /// <summary>The next N reads throw <see cref="L2UnavailableException"/> (a transient error).</summary>
+    public int FailNextReads { get; set; }
+
+    /// <summary>One-shot: the next key listing throws this (a non-NATS error mid-enumeration).</summary>
+    public Exception? NextListFails { get; set; }
+
     public int DirectReads { get; private set; }
     public int LeaderReads { get; private set; }
 
@@ -59,6 +68,12 @@ internal sealed class FakeL2Store : IL2Store
         ThrowIfUnavailable();
         lock (_gate)
         {
+            if (FailNextReads > 0)
+            {
+                FailNextReads--;
+                throw new L2UnavailableException("fake transient read error");
+            }
+
             if (leader) LeaderReads++;
             else DirectReads++;
             Expire(key);
@@ -96,18 +111,24 @@ internal sealed class FakeL2Store : IL2Store
         return result;
     }
 
-    public ValueTask<WriteResult> DeleteAsync(string key, ulong? expected, CancellationToken ct)
+    public async ValueTask<WriteResult> DeleteAsync(string key, ulong? expected, CancellationToken ct)
     {
+        if (BeforeDelete is { } hook)
+        {
+            BeforeDelete = null;
+            await hook(key);
+        }
+
         ThrowIfUnavailable();
         var h = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["KV-Operation"] = "DEL" };
         var result = Append(key, [], h, null, expected, L2Op.Delete);
         if (NextDeleteLosesReply && result.Status == WriteStatus.Committed)
         {
             NextDeleteLosesReply = false;
-            return new(result with { Status = WriteStatus.Unknown, Seq = 0, Error = "NatsJSPublishNoResponseException" });
+            return result with { Status = WriteStatus.Unknown, Seq = 0, Error = "NatsJSPublishNoResponseException" };
         }
 
-        return new(result);
+        return result;
     }
 
     public async IAsyncEnumerable<string> ListKeysAsync(string filter, [EnumeratorCancellation] CancellationToken ct)
@@ -124,6 +145,12 @@ internal sealed class FakeL2Store : IL2Store
         foreach (var k in keys)
         {
             await Task.Yield();
+            if (NextListFails is { } fail)
+            {
+                NextListFails = null;
+                throw fail;
+            }
+
             yield return k;
         }
     }

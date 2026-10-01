@@ -1,6 +1,6 @@
 # NATS Distributed Cache for .NET 10: Design Document
 
-Oct 1, 2026 · Erik Simonič · Status: v1.3 (lock-wait, renewal and release rules settled by milestone 3; frozen after review 7). Changes from here go through a new review and a version bump
+Oct 1, 2026 · Erik Simonič · Status: v1.4 (milestone-4 invalidation, recovery and health rules; frozen after review 8). Changes from here go through a new review and a version bump
 
 From v1.1 on this file is the source of truth; the online draft used up to v1.0 is no longer maintained. Spike evidence: `spike/RESULTS.md`.
 
@@ -174,7 +174,13 @@ public interface INatsCache
     ValueTask<bool> UpdateAsync<T>(string key, ulong expectedRevision, T value, CacheEntryOptions? options = null, CancellationToken ct = default); // CAS, Q8
     ValueTask RemoveAsync(string key, CancellationToken ct = default);
     ValueTask RemoveByTagAsync(string prefix, CancellationToken ct = default);   // prefix tags, Q9
+    ValueTask ClearAsync(CancellationToken ct = default);                         // flush every node's L1 (v1.4, admin)
 }
+
+public enum CacheHealth { Healthy, Degraded, Unavailable }  // NatsCache.Health / HealthDescription (section 8)
+public enum FactoryOutcome { Cached, FencedNewer, FencedDel, FencedExhausted, UncachedL2Full, Uncached, LocalOnly, Failed }
+public sealed record FactoryCompletion(string Key, FactoryReason Reason, string? LockToken, int Attempt, FactoryOutcome Outcome,
+    ulong Revision, DateTimeOffset StartedAt, DateTimeOffset CompletedAt, Exception? Error);
 
 public enum FailureMode { Open, Closed }
 public enum FactoryReason { Miss, EarlyRefresh, Takeover, Degraded }
@@ -210,16 +216,19 @@ services.AddNatsDistributedCache(o => {
     o.FailureMode = FailureMode.Open;            // default, overridable per call
     o.SchemaVersion = 1;                         // internal key suffix _s{n}; per type: o.ForType<Order>(2)
     o.KnownSchemaVersions = [1];                 // versions RemoveAsync deletes; add the previous one during a rolling deploy
+    o.OnFactoryCompleted = c => ledger.Add(c);   // v1.4: every factory run's outcome, after the write and the release (Origin ledger, section 9)
+    o.OutageJournalCapacity = 100_000;           // v1.4: keys and prefixes journaled during an outage (section 8)
 });
+services.AddHealthChecks().AddNatsCache();       // v1.4: readiness check, tagged "ready" (section 8)
 ```
 
 ### Read path: `GetOrCreateAsync`
 
 1. L1 lookup. Hit and not expired → return.
 2. Local single-flight: if another caller on this node is already loading the key, await its task.
-3. L2 `GetEntry` (Direct Get) on the internal key. Hit and logical expiry in the future → put into L1 with TTL = min(L1Ttl, remaining L2 life), jittered, but only if the entry's revision ≥ the key's high-water revision (section 7); if it is lower, re-read once from the stream leader, and if still lower return the newest value seen without filling L1 → return.
+3. L2 `GetEntry` (Direct Get) on the internal key. Hit and logical expiry in the future → put into L1 with TTL = min(L1Ttl, remaining L2 life), jittered, but only if the entry's revision ≥ the key's high-water revision (section 7); if it is lower, re-read once from the stream leader, and if still lower treat it as a miss (changed in v1.4: the higher revision came from an event, which carries no value, so there is no newer value to return; the miss goes through the lock and the leader double-check) → return.
 4. Miss, logically expired (`entry.Created` + `x-cache-ttl` in the past, even if NATS has not removed it yet), or large-value object missing → remember the key's KV revision (or absent) and acquire the distributed lock (section 5).
-    1. Won the lock → re-check L2 (double-checked; this revision is the fence's expected revision), run factory, fenced `Put` to L2, set L1, publish `set` notification, release lock.
+    1. Won the lock → re-check L2 (double-checked; this revision is the fence's expected revision), run factory, fenced `Put` to L2, set L1, release lock, publish `set` notification (section 5).
     2. Lost the lock → wait for the internal key's set, del or fail event on the notifications stream (plus 250 ms polling fallback); the wait ends by the rules in section 5 (waiter behaviour).
 5. Return the value to every waiter on this node.
 
@@ -240,9 +249,15 @@ services.AddNatsDistributedCache(o => {
 
 1. List keys under the prefix (`GetKeysAsync` with filter `{prefix}.>`, a headers-only consumer; cost grows with the number of keys under the prefix).
 2. Delete each through the helper as above; keys written after the listing are not affected (they are newer than the tag delete).
-3. Publish one `tag` event on `{prefix}.notify.{tagPrefix}` with `rev` = the highest tombstone sequence (or, if no keys matched, the stream's current last sequence, so the prefix HWM still blocks lagging reads). Each node evicts L1 keys under the prefix and holds a prefix high-water revision = `rev` for `L1Ttl × (1 + j)`: no entry under the prefix with a lower revision is filled into L1. Keys written between the listing and the last tombstone survive the tag delete (they are newer) but may be kept out of L1 for that window; this is expected.
+3. Publish one `tag` event on `{prefix}.notify.{tagPrefix}` with `rev` = the highest tombstone sequence (or, if no keys matched, the stream's current last sequence, so the prefix HWM still blocks lagging reads). Each node evicts L1 keys under the prefix and holds a prefix high-water revision = `rev` for `L1Ttl × (1 + j) + 1 s`, kept across a full L1 flush (v1.4, review 8): no entry under the prefix with a lower revision is filled into L1. Keys written between the listing and the last tombstone survive the tag delete (they are newer) but may be kept out of L1 for that window; this is expected.
 
-Update is the same as Set in v1, plus a compare-and-swap `UpdateAsync(key, rev, value)` using KV revisions (Q8, decided: in v1).
+Update is the same as Set in v1, plus a compare-and-swap `UpdateAsync(key, rev, value)` using KV revisions (Q8, decided: in v1). A committed update fills the writer's L1 and publishes `set` like a Set; an Unknown outcome is settled by the writer's msg id at the head of the subject (leader read). `UpdateAsync` needs NATS in both failure modes and throws `CacheUnavailableException` while it is down.
+
+### Clear path: `ClearAsync` (v1.4)
+
+Flushes the local L1 and wakes the node's waiters at once, then publishes one `clear` event on `{prefix}.notify._clear` (`key` = `*`); every node flushes its L1 (section 7, rule 6). L2 is untouched: clear is for restores and operator fixes, not a bulk delete.
+
+Every event above is published after the L2 write (and, for an owner, after the lock release, section 5) and is best effort: a failed publish is logged and counted (`cache.events.publish_failures`) but never fails the write; other nodes converge within `L1Ttl × (1 + j)`.
 
 ## 5. Distributed single-flight factory per key
 
@@ -261,7 +276,7 @@ A key's factory runs on exactly one node at a time: the node that wins the atomi
 
 ### Waiter behaviour
 
-1. Lose the acquire → register in the node's local waiter table (no new NATS consumer). The node's single notifications consumer wakes the waiter on the key's set, del or fail event; as a fallback it polls L2 (Direct Get) and the lock key every 250 ms (decided). The lock key is polled through the leader (v1.3), so a lagging replica can neither hide a free lock nor keep showing a released one.
+1. Lose the acquire → register in the node's local waiter table (no new NATS consumer). The node's single notifications consumer wakes the waiter on the key's set, del or fail event, and on a tag or clear event covering the key (v1.4); the signal is re-armed before each read, so an event that lands during the reads is not missed. As a fallback it polls L2 (Direct Get) and the lock key every 250 ms (decided). The lock key is polled through the leader (v1.3), so a lagging replica can neither hide a free lock nor keep showing a released one.
 2. Cache key gets a value → return it.
 3. Lock key deleted or expired without a value (owner failed or crashed) → retry acquire, with a small random backoff (10–50 ms) so waiters do not all hit the server at once. Winning it is a takeover: Reason = Takeover, `Attempt` = 1 + the number of distinct owners this waiter saw (so at least 2). After winning, the waiter does the same leader double-check as any owner, so a value written just before the release is returned without running the factory.
 4. `LockWaitTimeout` reached (changed in v1.3) → a live token on the lock key proves its owner renewed within one lease (the server TTL would have turned it into a marker otherwise), so keep waiting while one is held, up to the owner's bound: the owner's FactoryTimeout + 2 × LeaseTtl (read from the lock value) after first seeing that owner. An owner renews for at most FactoryTimeout + LeaseTtl and its lock is gone one lease later, so a well-behaved owner always frees the lock inside the bound and the waiter takes over through the lock. `LockWaitTimeout` is therefore the minimum wait, not the maximum. Only past both `LockWaitTimeout` and the owner's bound (an owner that keeps renewing against its own token, or a lock that cannot be acquired at all) does FailureMode apply (Q1): Open runs the factory locally (its result reaches L2 only through the fenced write) and the run is logged as a degraded window, Closed throws `CacheUnavailableException` naming the lock timeout. Token durations outside (0, 1 day] are ignored and the waiter's own values are used. The v1.2 rule ("keep waiting only if the lock revision changed") gave up on healthy owners whenever LeaseTtl / 3 exceeded LockWaitTimeout and has been removed.
@@ -271,6 +286,8 @@ A key's factory runs on exactly one node at a time: the node that wins the atomi
 | Case | Behaviour |
 | --- | --- |
 | Factory throws | Release lock, publish `fail` notification so waiters retry immediately, do not cache (negative caching is Q5) |
+| Owner's value did not reach L2 (v1.4) | `fail` is published for every owner outcome without a value in L2: factory threw, fenced-del, fenced-exhausted, uncacheable (absolute expiry too close, value too large, bucket full). Waiters wake and take over through the lock. Not for fenced-newer (the newer writer published `set`) or local-only (NATS is down). After a fenced-del the takeover runs the factory again: a fresh load after a delete, not an I1 overlap, because the first factory has finished |
+| Order of owner steps (v1.4) | Factory → fenced write → lock release → event → `OnFactoryCompleted`, so a waiter woken by the event never finds the lock still held, and the outcome hook sees the final outcome |
 | Owner node crashes mid-factory | Lock expires after `LeaseTtl`; a waiter takes over. Worst-case added latency = `LeaseTtl` |
 | Factory ignores its FactoryTimeout | The owner stops renewing at FactoryTimeout + LeaseTtl; the lock expires one lease later and a waiter takes over through the lock (v1.3). The late result is fenced: the stale owner returns the newer value |
 | Owner shuts down gracefully mid-factory | `DisposeAsync` waits up to `ShutdownTimeout` (default 10 s) for lock-holding factories to finish the fenced write and release; the lock is never released under a running factory, so a shutdown cannot start a second execution. Leases still held after the timeout expire with their TTL. Waiters on the disposed node get `OperationCanceledException` |
@@ -332,17 +349,17 @@ Subject `{prefix}.notify.{internalKey}` on stream `{prefix}_notifications` (`key
 
 ### Consumer rules
 
-1. Each node runs one ordered consumer (pull-based in NATS.Net, recreated by the client on gaps) on `{prefix}.notify.>`, starting at "new" on first boot.
+1. Each node runs one ordered consumer (pull-based in NATS.Net, recreated by the client on gaps) on `{prefix}.notify.>`. On first boot it takes the stream's `LastSeq` at subscribe time as its position and consumes from the next sequence (changed in review 8 from "starting at new"): a node that has not processed any event yet still has a position, so every rule-7 check covers it from the start. The node counts as subscribed (startup probes, tests) once the consumer exists; events published after that are seen.
 2. Events from the node itself are processed like any other. Every L1 write compares revisions, so own events are harmless, and this fixes the race where a newer remote event arrives before the node's own L1 write.
 3. `set`: evict L1 if the local entry's revision < `rev`. We evict rather than fetch, so the next read pulls from L2 (lazy, Q7 decided).
 4. `del`: evict unconditionally and raise the key's high-water revision to `rev`.
 5. `tag`: evict every L1 key under the prefix and hold a prefix high-water revision = `rev` (section 4, tag delete path).
 6. `clear`: flush the whole L1 (admin operation, used after restores); published on `{prefix}.notify._clear` with `key` = `*`.
-7. The node tracks the last processed stream sequence. After a reconnect, and whenever the delivered stream sequence (`Metadata.Sequence.Stream`) jumps by more than 1, it reads `StreamInfo` first. NATS.Net has no callback when it recreates the ordered consumer, but the stream carries only notify subjects and the filter covers them all, so any gap means lost events. If `Created` changed, `FirstSeq > lastSeen + 1`, or `LastSeq < lastSeen`, events were lost (stream recreated, `MaxMsgs` or `MaxAge` discard), so it flushes L1 and restarts from new; otherwise it resumes from `lastSeen + 1`.
+7. The node tracks the last processed stream sequence. After a reconnect, and whenever the delivered stream sequence (`Metadata.Sequence.Stream`) jumps by more than 1, it reads `StreamInfo` first. NATS.Net has no callback when it recreates the ordered consumer, but the stream carries only notify subjects and the filter covers them all, so any gap means lost events. If `Created` changed, `FirstSeq > lastSeen + 1`, or `LastSeq < lastSeen`, events were lost (stream recreated, `MaxMsgs` or `MaxAge` discard), so it flushes L1 and resumes right after the stream's current `LastSeq` (changed in v1.4 from "restarts from new": everything up to `LastSeq` describes writes before the flush, and resuming at a known sequence leaves no window between the flush and the resubscribe); otherwise it resumes from `lastSeen + 1`. Position check (v1.4, found by the integration tests): the NATS.Net ordered consumer follows a deleted and recreated stream silently, resuming at the old position with no error and no sequence jump, so neither trigger above fires. Each node therefore also reads `StreamInfo` every `NotificationsCheckInterval` (5 s) and runs the same check when `Created` changed, `LastSeq < lastSeen` or `FirstSeq > lastSeen + 1`; cost: one StreamInfo request per node per interval. A check requested while another is running is not lost: any cancel of the consumer other than shutdown runs the gap check next. The interval is internal in v1.4 and becomes an option if operators need it. Malformed events (not JSON, unknown op, missing key, wrong types) are skipped and the consumer keeps going.
 
 ### Per-key high-water revision (after review 2)
 
-Compare-on-revision alone misses one race: a node reads rev 10 from L2, the rev 11 event arrives while its L1 is empty (nothing to evict), and the node then fills L1 with rev 10. KV reads also use Direct Get, which any replica may answer without read-after-write coherency, so a read after the rev 11 event can still return rev 10. Each node therefore keeps a high-water revision (HWM) per internal key: the highest revision it has served or seen in a `set` or `del` event. L1 is filled only with entries at or above the HWM; a lower L2 read is re-read once from the stream leader, and if still lower the newest value seen is returned without filling L1. A new Set after a delete gets a higher revision than the tombstone, so the HWM never blocks it. HWM entries live for `L1Ttl × (1 + j)` and count toward the L1 size limit. Expect leader re-reads to be common under load: the spike measured 0.05 % stale Direct Gets on an idle cluster but about 5 % under lock load (NATS.Net `CreateAsync` failures are that same stale read).
+Compare-on-revision alone misses one race: a node reads rev 10 from L2, the rev 11 event arrives while its L1 is empty (nothing to evict), and the node then fills L1 with rev 10. KV reads also use Direct Get, which any replica may answer without read-after-write coherency, so a read after the rev 11 event can still return rev 10. Each node therefore keeps a high-water revision (HWM) per internal key: the highest revision it has served, written itself, or seen in a `set` or `del` event (v1.4: a `set` event raises the HWM even when nothing was evicted, and an L2 read or a committed own write raises it to the served revision). L1 is filled only with entries at or above the HWM; a lower L2 read is re-read once from the stream leader, and if still lower the read is a miss (section 4, changed in v1.4). A new Set after a delete gets a higher revision than the tombstone, so the HWM never blocks it. HWM entries live for `L1Ttl × (1 + j) + 1 s` and count toward the L1 size limit; a full L1 flush (clear, lost events, recovery) drops values only, never HWMs (v1.4, review 8). Expect leader re-reads to be common under load: the spike measured 0.05 % stale Direct Gets on an idle cluster but about 5 % under lock load (NATS.Net `CreateAsync` failures are that same stale read).
 
 ### Why a stream and not core pub/sub or a KV watch
 
@@ -353,6 +370,8 @@ Compare-on-revision alone misses one race: a node reads rev 10 from L2, the rev 
 | Watch on `{prefix}_cache` itself | No separate publish; can never miss a write that reached L2 | Every node receives every value payload (use headers-only watch to avoid it); no place for `fail` / `clear` events |
 
 The L1 TTL stays the final safety net: even if every event were lost, staleness is bounded by `L1Ttl × (1 + j)`.
+
+Prefix HWMs and full flushes (decided in review 8): a tag-deleted key gets no per-key HWM on other nodes (one tag event, no per-key del events), so its prefix HWM is all that stops a lagging replica's Direct Get from refilling it with the deleted value. A full L1 flush therefore drops values only and keeps every HWM; HWMs expire on their own (at most one prefix HWM per tag delete, for `L1Ttl × (1 + j) + 1 s`).
 
 ## 8. Resilience and auto recovery
 
@@ -371,7 +390,7 @@ The library never needs an app restart to recover: the NATS client reconnects fo
 
 ### Operation retries
 
-KV calls go through a `Microsoft.Extensions.Resilience` pipeline: timeout 2 s, retry 3 times with exponential backoff and jitter on transient errors (no responders / 503, timeout, leader election in progress), then a circuit breaker that opens after 50 % failures over 10 s and probes every 5 s.
+KV calls go through a `Microsoft.Extensions.Resilience` pipeline: timeout 2 s, retry 3 times with exponential backoff and jitter on transient errors (no responders / 503, timeout, leader election in progress), then a circuit breaker that opens after 50 % failures over 10 s and probes every 5 s. Not built yet (v1.4): today the L2 store retries transient errors itself, and any call that still fails with `L2UnavailableException` puts the node into the outage state below; the pipeline, the breaker and a bound on concurrent NATS calls (a `SemaphoreSlim`, `MaxConcurrentL2Operations`) come with milestone 5. Until then a miss during an outage pays the L2 timeout and retries (about 4 s) on every call (review 8).
 
 ### Degraded mode
 
@@ -379,16 +398,19 @@ KV calls go through a `Microsoft.Extensions.Resilience` pipeline: timeout 2 s, r
 | --- | --- | --- | --- |
 | Healthy | L1 → L2 → factory | L2 + notify | Distributed |
 | NATS down (breaker open) | Open: L1 → factory; Closed: throw (Q1) | Open: L1 only, written keys journaled and replayed as revision-fenced del on recovery; Closed: throw (Q1, Q2) | Open: local only; Closed: none (throws) |
-| Recovering | L1 cleared if the StreamInfo check (section 7, rule 7) shows lost events, then normal | Normal | Distributed |
+| Recovering | L1 flushed if the node wrote L1-only or journaled writes during the outage; lost events are handled by section 7, rule 7 (review 8); then normal | Normal | Distributed |
+
+Outage state (v1.4): the first `L2UnavailableException` on any path marks the node as cut off and starts one recovery loop, which probes the cache bucket (StreamInfo `LastSeq`) every 1 s and runs the recovery steps below when the probe succeeds. Stores that are not provisioned yet are "not ready", not an outage (review 8), unless the node already wrote L1-only. Writers journal and fill L1 before they raise the outage flag, and the loop ends only under the same lock while no outage is flagged and the journal is empty, so a write journaled during or just after a replay is always replayed (review 8). A waiter rides out up to 2 consecutive L2 errors (waiting for the next signal or poll) before FailureMode applies, so one transient error does not run a second factory beside a healthy owner (review 8). In Open mode an outage write (Set, or a local factory result) goes to L1 only, with revision 0, and replaces any cached copy of the key, so the node reads its own write (v1.4: compare-on-revision would otherwise keep the cached pre-outage copy); Remove and RemoveByTag evict locally. Keys written by Set or Remove and prefixes removed by RemoveByTag are journaled (a local factory result is not: it never reached L2, and the recovery flush drops it) with the time of the node's last outage write (review 8: the latest time is the right fence, because an entry another node wrote between two of this node's outage writes is older than the last one, and a cache delete is always safe), up to `OutageJournalCapacity` (100 000) entries; beyond that a write is not journaled, an error is logged on recovery, and other nodes may serve pre-outage values until they expire (L1 is flushed regardless).
 
 ### Recovery steps on reconnect
 
 1. Re-verify buckets and stream exist (recreate if the cluster was wiped).
-2. Resume the notification consumer from the last sequence, or flush L1 if the gap is too old. A node that wrote L1-only during the outage (Open mode) always flushes L1: outage writes are discarded from L1, and every key written during the outage is re-read from the stream leader on recovery; if its `entry.Created` is earlier than the node's first outage write for that key minus a 1 s skew margin (server vs local clock, NTP assumed), it is deleted at that revision through the helper plus a del event, otherwise skipped because someone wrote after the outage began, so no other node keeps serving the pre-outage L2 value (decided after review).
+2. Resume the notification consumer from the last sequence, or flush L1 if the gap is too old. A node that wrote L1-only during the outage (Open mode) flushes L1, and only such a node does (review 8: a transient error with no outage write costs no flush, so a leader election is not a miss storm): outage writes are discarded from L1, and every key written during the outage is re-read from the stream leader on recovery; if its `entry.Created` is earlier than the node's last outage write for that key minus a 1 s skew margin (server vs local clock, NTP assumed), it is deleted at that revision through the helper plus a del event, otherwise skipped because someone wrote after the outage began, so no other node keeps serving the pre-outage L2 value (decided after review).
+   If the replay fails for any reason, the unreplayed entries go back into the journal (keeping the latest write time) and the loop keeps probing. An event that reaches the node during the outage for a pre-outage revision can still evict its revision-0 outage value; the node then misses (Open mode runs the factory locally), it never serves an older value. A tag prefix is replayed by listing its keys and replaying each.
 3. Close the breaker after a successful probe.
 4. Emit a `cache.recovered` metric and log event with outage duration.
 
-Health checks: `/health/live` ignores NATS; `/health/ready` reports `Degraded` (not `Unhealthy`) while NATS is down in Open mode, so the load balancer keeps routing to the node; in Closed mode it reports Unhealthy (Q1, Q2). Envoy's health check runs every 1 s with healthy_threshold 1. TestApi takes the run's FailureMode from the `Cache__FailureMode` env var, with an optional `X-Cache-FailureMode` request header for per-call tests.
+Health checks: `/health/live` ignores NATS; `/health/ready` (the library's `AddNatsCache()` check, tagged "ready", v1.4) reports `Degraded` (not `Unhealthy`) while the node is not healthy in Open mode (stores unusable, connection not open, outage, or not provisioned yet); readiness follows the global FailureMode, not per-call overrides (review 8), so the load balancer keeps routing to the node; in Closed mode it reports Unhealthy (Q1, Q2). Envoy's health check runs every 1 s with healthy_threshold 1. TestApi takes the run's FailureMode from the `Cache__FailureMode` env var, with an optional `X-Cache-FailureMode` request header for per-call tests.
 
 ## 9. Test environment
 
@@ -531,6 +553,10 @@ The Validator prints a table of invariants × scenarios with pass/fail and the o
 | — | Lease bounds | `MinLeaseTtl` 6 s, `MaxLeaseTtl` 60 s (v1.3) |
 | — | Shutdown | Never release a lock under a running factory; wait `ShutdownTimeout` for owners (v1.3) |
 | — | JWT single-flight evidence | Counters only (I2), no overlap check |
+| — | Factory outcome hook | `OnFactoryCompleted(FactoryCompletion)` after the write and the release, inline, exceptions swallowed; feeds the Origin ledger (v1.4) |
+| — | Lost-event detection | Gap check on a sequence jump, a reconnect, and a 5 s position check for silently followed recreated streams; resume after `LastSeq` after a flush (v1.4) |
+| — | Outage fill | Revision 0, replaces the cached copy; recovery flushes L1 when the node wrote L1-only (v1.4, review 8) |
+| — | HWMs and flushes | A full L1 flush keeps per-key and prefix HWMs (review 8) |
 
 ### Risks
 
@@ -542,13 +568,14 @@ The Validator prints a table of invariants × scenarios with pass/fail and the o
 | Low-CPU .NET nodes starve the thread pool under bursts | Timeouts that look like cache bugs | Fallback: fewer API workers (e.g. 3 replicas × 1 CPU instead of 5 × 0.5); GC and thread-pool tuning, measure with `dotnet-counters` |
 | Lease expiry under GC pause gives double execution | Violates I1 | Renewal, fencing check, and honest guarantee wording |
 | Clock skew between containers | Early or late logical expiry | Validator measures skew; use server timestamps where possible |
+| Recreated notifications stream followed silently by the ordered consumer | Lost events not detected, stale L1 until `L1Ttl` | 5 s position check (v1.4); C-matrix test with a stream delete |
 
 ### Milestones
 
 1. Done (Sep 30, 2026; `spike/RESULTS.md`). Spike on NATS 2.15.0 (current requirement), 2.14.7, 2.12.15 and 2.11.2: per-key TTL and delete markers on expiry; CAS against a marker revision; TTL timers resuming after a full restart on file storage; lock create/delete throughput on file-backed R3 at 0.5 CPU with the default `sync_interval`; Direct Get staleness under load; leader-read latency at 0.5 CPU; ordered consumer started below FirstSeq (silent skip?); meta-only watch delivering TTL markers; DEL through the publish helper; `Create` contention.
 2. Done (Oct 1, 2026). Core library: L1/L2, jitter, key validation, bucket provisioning, unit tests.
 3. Done (Oct 1, 2026; review 7). Distributed single-flight with leases, renewal, fencing, early refresh; integration tests (5 nodes racing on one key: one factory call; crashed owner taken over; renewal past the TTL; lost lease resolved by the fence).
-4. Invalidation stream, reconnect resume, degraded mode.
+4. Done (Oct 1, 2026; review 8). Invalidation stream, reconnect resume, degraded mode with the outage journal, readiness check, factory outcome hook; integration tests (events across nodes, waiter woken before its poll, reconnect resume, recreated stream, outage replay and readiness on a paused NATS).
 5. TestApi, Origin, compose rig with CPU limits, Prometheus/Grafana.
 6. k6 K1–K8 and Validator with invariants I1–I8.
 7. Chaos matrix C1–C8, tuning, v1.0 release notes.
@@ -720,3 +747,43 @@ Scope: the milestone-3 code (`DistributedLock`, `NatsCache` lock path and early 
 | D7: no lower bound on LeaseTtl | Low | `MinLeaseTtl` 6 s |
 | Test gaps: unknown renew/release outcomes, outage during renewal, release on double-check hit / factory timeout / outage, lost lease resolved by the fence, owner change, stale lock reads, dispose, a fake-only test, an unlocked list read, real-time negatives | — | Added (unit 82 → 121, integration 8 → 16); fake gains lost-delete-reply and unapplied-unknown-put hooks and locked snapshots; negatives now wait on an observable signal |
 
+### v1.4: changes from milestone 4 (Oct 1, 2026)
+
+Milestone 4 implemented sections 7 and 8. Its tests were validated beyond coverage: Stryker.NET mutation testing (56.9 %, 71.4 % of covered mutants; the rest are mostly the NATS adapters, which only integration tests reach) and a sabotage suite of 43 deliberate design-rule violations, each of which must fail a named test (`tests/Sabotage`, all caught). Unit tests 121 → 257, integration 16 → 25; after review 8, 52 sabotage checks.
+
+| Change | Detail |
+| --- | --- |
+| `ClearAsync` | On `INatsCache`; flushes local L1, publishes `clear` (section 4) |
+| `fail` events | For every owner outcome without a value in L2, not only a thrown factory (section 5) |
+| Owner step order | Factory → fenced write → release → event → outcome hook (section 5) |
+| Outcome hook | `OnFactoryCompleted(FactoryCompletion)` with `FactoryOutcome` (sections 4, 12) |
+| Waiter wake-ups | Also on tag and clear; signal re-armed before each read (section 5) |
+| Below-floor read | A read still below the floor after the leader re-read is a miss (section 4) |
+| HWM | Raised by every `set` event, every L2 read served, and every committed own write (section 7) |
+| Resume after a flush | Right after `LastSeq`, not from "new" (section 7, rule 7) |
+| Position check | Every 5 s, for a stream recreated under a live consumer (found by the integration tests; section 7) |
+| Outage state | Entered on any `L2UnavailableException`, 1 s probe, loop ends after recovery; journal capacity, overflow and restore on a mid-replay drop (section 8) |
+| Outage fill | Replaces a cached copy so the node reads its own write (found by the integration tests; section 8) |
+| Readiness | `AddNatsCache()` health check, Degraded in Open mode, Unhealthy in Closed mode (section 8) |
+| Not built yet | Resilience pipeline, circuit breaker, bounded concurrent NATS calls (section 8) |
+| Prefix HWMs | Kept across a full flush (decided in review 8; section 7) |
+| Fixed in the code, no design change | A single-flight race (a caller woken by a failed load could rejoin it and get its failure instead of a retry); the L1 key index dropping replaced entries |
+
+### Review 8: Fable, Oct 1 2026 (all findings accepted; v1.4 frozen)
+
+Scope: the v1.4 draft against the milestone-4 code (invalidation, recovery, health). Verdict: the premise holds on every traced path (owner order factory → fenced write → release → event → hook; no release under a running factory; HWM on events, reads and own writes; sound resume after `LastSeq`). What blocked the freeze were the findings below; none touches the lock protocol. Every code fix has a unit test and a sabotage check that reverts it (52 checks, all caught).
+
+| Finding | Severity | Change made |
+| --- | --- | --- |
+| Rule 7 skipped on a node that had processed no event (`_lastSeen` null): a reconnect or recreated stream went undetected | High | Position = the stream's `LastSeq` at first subscribe, consumed from the next sequence (section 7, rule 1) |
+| A transport error while listing keys escaped as a raw exception: RemoveByTag skipped the outage path, and the replay lost its drained journal | Medium | Enumeration errors mapped to `L2UnavailableException`; the journal is restored on any replay failure |
+| Outage-end race: writers raised the outage before journaling, so a key journaled as recovery ended had no loop to replay it | Medium | Journal and L1 first, then the outage flag; the loop ends under the writers' lock only with no outage flagged and an empty journal |
+| Recovery flushed L1 after every outage (one timeout, a slow startup), and "not provisioned yet" counted as an outage | Medium | Flush only after L1-only or journaled writes; not provisioned = not ready (section 8) |
+| Stale doc: section 7 "return the newest value seen", section 4 step 4.1 order, HWM lifetime | Medium | Corrected (miss; release before event; `L1Ttl × (1 + j) + 1 s`) |
+| Open prefix-HWM issue: a full flush dropped the only protection of tag-deleted keys on other nodes | Medium (decision) | Flushes keep every HWM (section 7) |
+| Journal kept the earliest outage-write time, losing a later outage write when another node wrote in between | Low | Latest time is the fence |
+| Position check read multi-word fields unguarded; a check request could be lost during a running check | Low | Fields under a lock; any non-shutdown cancel runs the gap check |
+| A non-NATS write error reached the outcome hook without its cause | Low | Recorded as the completion's `Error` |
+| One transient L2 error sent a waiter to a local factory run beside a healthy owner | Low | Waiters ride out 2 consecutive errors before FailureMode (section 8) |
+| Readiness follows only the global mode; outage misses pay the full timeout chain | Low | Documented (section 8) |
+| Test gaps | — | Unit: never-processed node across a reconnect, replay failure restore, write during the replay, no flush after a transient outage, not provisioned ≠ outage, journal overflow at cache level, Closed-mode local eviction, prefix HWM across a clear, write-error cause, waiter riding out an error, `fail` for null and bucket-full outcomes. Integration: reconnect before any event, tag delete during a paused NATS, no flush under 12 s of steady writes. Not added: a real `MaxAge` discard while one node is cut off (the rig cannot isolate one node yet; the fake and the spike cover it) |

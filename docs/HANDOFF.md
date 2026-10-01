@@ -1,6 +1,6 @@
 # Handoff: NATS distributed cache
 
-Oct 1, 2026 (late evening). Milestones 1–3 are done and pushed. Milestone 4 (invalidation) is implemented and committed, the owner's `//TODO-AI` review is addressed, and the tests are validated: 244 unit tests (green in 64 runs at 8× parallel on `eriks`), 22 integration tests against real NATS, Stryker 56.9 % (71.4 % of covered mutants), and all 43 sabotage checks caught (see "Proving the tests catch bugs" under "How to run"). Not yet done for milestone 4: the DESIGN.md update and its Fable review. The design is frozen at v1.3 in `docs/DESIGN.md`, the single source of truth; milestone 4 hasn't changed it yet.
+Oct 1, 2026 (night). Milestones 1–4 are done. Milestone 4 (invalidation, recovery, health) passed review 8 and DESIGN.md is frozen at v1.4, the single source of truth. Tests: 257 unit (green under 8× parallel stress on `eriks`), 25 integration against real NATS, Stryker 56.9 % (71.4 % of covered mutants, measured before review 8), and all 52 sabotage checks caught (see "Proving the tests catch bugs" under "How to run"). Next: the v1.5 rig design pass and milestone 5.
 
 ## State at a glance
 
@@ -10,7 +10,7 @@ Oct 1, 2026 (late evening). Milestones 1–3 are done and pushed. Milestone 4 (i
 | 2. Core library: L1/L2, jitter, keys, provisioning, unit tests | Done, committed (`7e0aae4`) | `src/`, `tests/` |
 | 3. Distributed single-flight: leases, renewal, fencing, early refresh | Done, reviewed (review 7), committed (`4a16c84`) | `Internal/DistributedLock.cs`, `NatsCache.cs` |
 | Spike worker sweep (§9) | Done, committed (`b1c9f5b`), run on `eriks` | `spike/run-sweep.sh`, `spike/docker-compose.full.yml` |
-| 4. Invalidation stream, reconnect resume, degraded-mode journal | Implemented, owner review addressed, unit and integration tests validated, committed; DESIGN.md update and Fable review to do | see below |
+| 4. Invalidation stream, reconnect resume, degraded-mode journal | Done, reviewed (review 8), design v1.4 | see below |
 | 5. TestApi, Origin, compose rig with CPU limits, Prometheus/Grafana | To do | — |
 | 6. k6 K1–K8 and Validator (I1–I8) | To do | — |
 | 7. Chaos C1–C8, tuning, v1.0 | To do | — |
@@ -41,16 +41,18 @@ Bug found and fixed along the way (milestone 2): `L1Store`'s key index removed a
 
 Done since the first handoff: the owner's five `//TODO-AI` comments (`L1Item<T>` stores values unboxed; more `Decode` tests; the rest answered: lock vs semaphore, cache vs object store, single-flight threads), the `Eventually` fix (it asserts its last evaluation), seven timing-fragile tests fixed, a `SingleFlight` race fixed (a caller woken by a failed load could rejoin that finished load and get its failure instead of a retry: the key now leaves the table before the task completes), and 103 new tests from the mutation and sabotage runs.
 
-Found by the integration tests and fixed (both need a line in the v1.4 design pass):
+Found by the integration tests and fixed (recorded in v1.4):
 - **Recreated notifications stream under a live consumer**: the NATS.Net ordered consumer follows a deleted and recreated stream silently, resuming at the old position with no error and no sequence jump, so the rule-7 gap check never ran and L1 was never flushed. `NotificationListener` now checks the stream position every `NotificationsCheckInterval` (5 s, internal option) and runs the gap check on a changed creation time, a last sequence below the processed one, or unprocessed discarded events. The fake's `Recreate(dropConsumers: false)` models the silent case.
 - **Own outage write invisible**: in Open mode an outage write (revision 0) never replaced a cached pre-outage copy (compare-on-revision kept the higher revision), so the node kept serving the old value. `DegradedFill` now evicts first; recovery flushes L1 anyway.
 
+Review 8 (DESIGN.md §13) found and fixed: rule 7 skipped on a node that had processed no event (it now takes the stream's `LastSeq` at subscribe); key-listing errors escaping the outage path and losing the replay journal; an outage-end race (writers now journal before raising the outage, and the recovery loop ends under the same lock); L1 flushed after every outage (now only after L1-only writes; "not provisioned yet" is no longer an outage); prefix floors dropped by `Clear()` (now kept); the journal keeping the earliest instead of the latest write time; unguarded position-check fields; a write error without its cause in the outcome hook; a waiter running a second factory after one transient error (it now rides out two).
+
 Open items, in order:
-1. **Prefix floors and `L1Store.Clear()`** (warning, future work; see "Deviations and gaps"): decide whether `Clear()` should keep the prefix floors, and fix it with a test plus a sabotage check.
-2. **Bound concurrent NATS calls** (owner's question on `SingleFlight`): a `MaxConcurrentL2Operations` limit (SemaphoreSlim) as part of the §8 resilience pipeline.
-3. ~~Integration tests~~ done: `InvalidationIntegrationTests` (set/del/tag/clear across nodes, waiter woken before its poll, reconnect resume, recreated stream) and `OutageIntegrationTests` (its own container, paused: outage replay, readiness check Degraded → Healthy through DI).
-4. **Design doc**: record milestone 4 (and the prefix-floor decision, the periodic position check and `NotificationsCheckInterval`, the outage-fill eviction) in DESIGN.md (subscribed sentinel, resume after `LastSeq` instead of "new", `ClearAsync` on the interface, `fail` on every uncached owner outcome, outcome hook, health, journal capacity, connection settings), then a **Fable review**, apply all findings, log it in §13 and bump to v1.4.
-5. Then the v1.4 rig pass for `eriks` (below) and milestones 5–6.
+1. **v1.5 rig design pass** for `eriks` (below), then milestone 5 (TestApi, Origin, compose rig, Prometheus/Grafana).
+2. **Resilience pipeline** (§8, milestone 5): `Microsoft.Extensions.Resilience` retries, circuit breaker, and a bound on concurrent NATS calls (`MaxConcurrentL2Operations`, owner's question on `SingleFlight`). Until then a miss during an outage costs about 4 s per call.
+3. **Real `MaxAge` discard test**: needs one node cut off while others publish (e.g. a toxiproxy between that node and NATS in the milestone-5 rig); today the fake and the spike cover it.
+4. **`NotificationsCheckInterval`** is internal; make it an option if operators need it.
+5. Then milestone 6.
 
 ## Remote load-test machine (`eriks`)
 
@@ -72,7 +74,7 @@ Open items, in order:
   The stream leader averaged about 31 % of its 50 % cap (scaled) and about 67 % of 100 % (full), so the leader is not fully saturated. Re-baseline the K3 budget (§10) from these numbers instead of the laptop's 2 000 ops/s.
 - In the first full run, the helper step inside `run-spike.sh` left no result (status 1); the re-run was clean. The cause is unknown.
 
-## Planned v1.4 design pass (before milestones 5–6)
+## Planned v1.5 design pass (before milestones 5–6)
 
 Agreed with the owner, not started:
 - CPU layout for the 9950X3D: NATS + 5 API nodes on CCD0 (cores 0–7, siblings 16–23); Envoy, Origin, observability and k6 on CCD1. The §9 pinning is written for the 12-thread laptop.
@@ -83,7 +85,7 @@ Agreed with the owner, not started:
 ## Repo layout
 
 ```
-docs/DESIGN.md        design v1.3 (frozen); §13 logs seven Fable reviews
+docs/DESIGN.md        design v1.4 (frozen); §13 logs eight Fable reviews
 docs/HANDOFF.md       this file
 spike/                milestone-1 spike: Program.cs (14 checks, SPIKE_WORKERS), compose rig + full-size override, run-spike.sh, run-sweep.sh, RESULTS.md
 src/NatsDistributedCache/             core library (netstandard2.1 + net10.0)
@@ -108,12 +110,12 @@ tests/NatsDistributedCache.IntegrationTests/  xUnit v3 + Testcontainers, single 
 
 ```bash
 dotnet build NatsDistributedCache.slnx                           # both TFMs, warnings as errors
-dotnet run --project tests/NatsDistributedCache.UnitTests        # 244 tests, ~9 s
+dotnet run --project tests/NatsDistributedCache.UnitTests        # 257 tests, ~9 s
 dotnet run --project tests/NatsDistributedCache.UnitTests -- -method "*InvalidationTests*"   # one class
-dotnet run --project tests/NatsDistributedCache.IntegrationTests # 22 tests, ~40 s, needs Docker (one class pauses its own container)
+dotnet run --project tests/NatsDistributedCache.IntegrationTests # 25 tests, ~60 s, needs Docker (one class pauses its own container; one runs alone)
 spike/run-spike.sh                                               # full spike on nats:2.15.0-alpine, ~4 min, needs Docker
 spike/run-sweep.sh scaled|full                                   # helper lock sweep 8/16/32/64 workers
-tests/Sabotage/run.py [--only id,id] [--jobs N]                  # 43 deliberate design-rule bugs; each must fail its test; writes tests/Sabotage/REPORT.md (~25 min locally, 6 min on eriks with --jobs 8)
+tests/Sabotage/run.py [--only id,id] [--jobs N]                  # 52 deliberate design-rule bugs; each must fail its test; writes tests/Sabotage/REPORT.md (~25 min locally, 6 min on eriks with --jobs 8)
 cd tests/NatsDistributedCache.UnitTests && DOTNET_ROOT=$HOME/.dotnet dotnet stryker --output <dir>   # mutation testing, ~30 min locally, 7 min on eriks (DOTNET_ROOT=/usr/lib/dotnet)
 ```
 
@@ -140,7 +142,7 @@ Proving the tests catch bugs:
 - **NATS.Net XML docs omit record properties**; to check an API, reflect over the 3.3.0 assemblies (see the scratch probe approach: a tiny console project that prints `GetProperties()`).
 - **All writes are RAFT-atomic per key**: our publish helper uses the same `Nats-Expected-Last-Subject-Sequence` check NATS.Net's KV `CreateAsync` / `UpdateAsync` use, without their TTL and Direct-Get problems (answered for the owner on Oct 1).
 - **Not implemented yet**: large values in the Object Store (returned uncached, `cache.large_values_skipped`); `HybridCache` / `IDistributedCache` adapters (Q10); circuit breaker and resilience pipeline (§8; today the L2 store retries, then degrades).
-- **Warning: `L1Store.Clear()` drops the prefix floors but keeps the per-key floors.** After a flush (a `clear` event, lost events, or recovery), a lagging replica's Direct Get could refill a key under a tag-deleted prefix with a value older than that tag delete, until the entry expires: an I5 regression window on one node. Per-key floors survive because they live in the MemoryCache under their own keys, outside the user-key index that `Clear()` walks. Likely fix: keep the prefix floors in `Clear()` (they expire on their own after `FloorTtl`). Deliberately not pinned by a test until decided; Stryker reports the `_prefixFloors.Clear()` line as a survivor for that reason.
+- **Floors survive a full L1 flush** (review 8): `L1Store.Clear()` removes values only. Tag-deleted keys have no per-key floor on other nodes, so the prefix floor is their only protection against a lagging replica.
 - **Fenced-del and waiters**: an owner fenced by a delete publishes `fail`, and waiters take over and run the factory again. This is a fresh load after a delete, not an I1 overlap, because the owner's factory has finished.
 - **Unit-test fakes**: `FakeL2Store` models History 1, a global sequence, 10071 with the last sequence in the text, msg-id dedup, TTL → MaxAge marker → empty, DEL tombstones, stale Direct Gets, lost put/delete replies, unknown puts that never apply, rejections, outages and `LastSequenceAsync`. `FakeNotificationTransport` models a global sequence, live delivery, start-by-sequence that silently skips to `FirstSeq`, `SkipDeliveries`, `DiscardUpTo`, `Recreate`, `Disconnect` + `RaiseReconnected`, and outages. Keep both in sync with real NATS behaviour; confirm anything new in the spike or the integration tests first.
 

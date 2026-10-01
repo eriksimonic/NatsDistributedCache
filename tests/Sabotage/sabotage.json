@@ -207,7 +207,7 @@
     "id": "resume-from-new",
     "rule": "§7 rule 7: without loss, resume from lastSeen + 1 (not from new)",
     "file": "src/NatsDistributedCache/Internal/NotificationListener.cs",
-    "find": "var start = _lastSeen is { } seen ? seen + 1 : (ulong?)null;",
+    "find": "var start = _lastSeen + 1;",
     "replace": "var start = (ulong?)null;",
     "expect": [
       "Sequence_gap_without_loss_resumes_and_applies_the_missed_events"
@@ -267,10 +267,10 @@
   },
   {
     "id": "recovery-no-flush",
-    "rule": "§8 recovery: L1 is always flushed when NATS comes back",
+    "rule": "§8 recovery: L1 is flushed when the node wrote L1-only during the outage",
     "file": "src/NatsDistributedCache/NatsCache.cs",
-    "find": "_journal.Drain();\n        _l1.Clear();\n",
-    "replace": "_journal.Drain();\n",
+    "find": "            _l1.Clear();\n            _signals.PulseAll();\n            _metrics.L1Flushes",
+    "replace": "            _signals.PulseAll();\n            _metrics.L1Flushes",
     "expect": [
       "Outage_writes_are_replayed_as_fenced_deletes_on_recovery",
       "Recovery_flushes_values_computed_locally_during_the_outage"
@@ -290,8 +290,8 @@
     "id": "closed-mode-open",
     "rule": "Q1: FailureMode.Closed throws when NATS is down",
     "file": "src/NatsDistributedCache/NatsCache.cs",
-    "find": "if ((o?.FailureMode ?? _options.FailureMode) == FailureMode.Closed)",
-    "replace": "if ((o?.FailureMode ?? _options.FailureMode) == FailureMode.Closed && false)",
+    "find": "private bool IsClosed(CacheEntryOptions? o) => (o?.FailureMode ?? _options.FailureMode) == FailureMode.Closed;",
+    "replace": "private bool IsClosed(CacheEntryOptions? o) => false;",
     "expect": [
       "Closed_mode_throws_when_l2_is_down"
     ]
@@ -340,8 +340,8 @@
     "id": "recovery-loop-never-stops",
     "rule": "§8 recovery: the probe loop ends after a successful recovery",
     "file": "src/NatsDistributedCache/NatsCache.cs",
-    "find": "if (await RecoverAsync(ct).ConfigureAwait(false)) return;",
-    "replace": "await RecoverAsync(ct).ConfigureAwait(false);",
+    "find": "if (await RecoverAsync(ct).ConfigureAwait(false))\n                {",
+    "replace": "if (await RecoverAsync(ct).ConfigureAwait(false) && false)\n                {",
     "expect": [
       "Recovery_loop_probes_once_per_second_and_stops_after_recovering"
     ]
@@ -444,6 +444,97 @@
     "replace": "_watch ??= Task.CompletedTask;",
     "expect": [
       "Stream_recreated_under_a_live_consumer_is_found_by_the_position_check"
+    ]
+  },
+  {
+    "id": "listener-starts-at-new",
+    "rule": "§7 rule 7: a node has a stream position from its first subscribe (review 8)",
+    "file": "src/NatsDistributedCache/Internal/NotificationListener.cs",
+    "find": "                        _lastSeen ??= pos.LastSeq;\n",
+    "replace": "",
+    "expect": [
+      "Node_that_never_processed_an_event_still_replays_events_missed_across_a_reconnect"
+    ]
+  },
+  {
+    "id": "replay-restores-only-on-nats-errors",
+    "rule": "§8 recovery: any replay failure restores the journal (review 8)",
+    "file": "src/NatsDistributedCache/NatsCache.cs",
+    "find": "        catch\n        {\n            _journal.Restore(pending, pendingPrefixes); // any failure: never lose the unreplayed entries (review 8)\n            throw;\n        }\n",
+    "replace": "",
+    "expect": [
+      "Replay_that_fails_with_any_error_keeps_the_journal_and_retries"
+    ]
+  },
+  {
+    "id": "recovery-ends-with-a-journal",
+    "rule": "§8 recovery: entries journaled during the replay keep the loop running (review 8)",
+    "file": "src/NatsDistributedCache/NatsCache.cs",
+    "find": "            if (!_journal.IsEmpty) return false; // written during the replay (NATS flapped): replay again at the next probe\n",
+    "replace": "",
+    "expect": [
+      "Write_journaled_during_the_replay_is_replayed_too"
+    ]
+  },
+  {
+    "id": "recovery-always-flushes",
+    "rule": "§8 recovery: no L1 flush after an outage without L1-only writes (review 8)",
+    "file": "src/NatsDistributedCache/NatsCache.cs",
+    "find": "if (Interlocked.Exchange(ref _outageWrites, 0) == 1 || keys.Count > 0 || prefixes.Count > 0)",
+    "replace": "if (Interlocked.Exchange(ref _outageWrites, 0) >= 0)",
+    "expect": [
+      "Transient_outage_without_outage_writes_keeps_l1"
+    ]
+  },
+  {
+    "id": "not-provisioned-is-an-outage",
+    "rule": "§8: stores not provisioned yet are not an outage (review 8)",
+    "file": "src/NatsDistributedCache/NatsCache.cs",
+    "find": "        if (cause is L2UnavailableException { NotProvisioned: true } && _journal.IsEmpty && Volatile.Read(ref _outageWrites) == 0) return;\n",
+    "replace": "",
+    "expect": [
+      "Stores_not_provisioned_yet_are_not_an_outage"
+    ]
+  },
+  {
+    "id": "clear-drops-prefix-floors",
+    "rule": "§7 HWM: prefix floors survive a full L1 flush (review 8, I5)",
+    "file": "src/NatsDistributedCache/Internal/L1Store.cs",
+    "find": "        foreach (var key in _keys.Keys.ToList()) _cache.Remove(key);\n",
+    "replace": "        foreach (var key in _keys.Keys.ToList()) _cache.Remove(key);\n        _prefixFloors.Clear();\n",
+    "expect": [
+      "Prefix_floor_survives_a_clear_so_a_lagging_replica_cannot_refill_a_tag_deleted_key"
+    ]
+  },
+  {
+    "id": "journal-keeps-earliest",
+    "rule": "§8 journal: the latest outage-write time is the replay fence (review 8)",
+    "file": "src/NatsDistributedCache/Internal/OutageJournal.cs",
+    "find": "existing > at ? existing : at",
+    "replace": "existing < at ? existing : at",
+    "expect": [
+      "Journal_keeps_the_latest_write_whatever_the_order",
+      "Journal_holds_exactly_its_capacity_keeps_the_first_write_and_reports_overflow_once"
+    ]
+  },
+  {
+    "id": "write-error-uncaptured",
+    "rule": "Outcome hook: a non-NATS write error is reported with its cause (review 8)",
+    "file": "src/NatsDistributedCache/NatsCache.cs",
+    "find": "                error = ex; // e.g. the serializer: the outcome hook reports the cause (review 8)\n",
+    "replace": "                _ = ex;\n",
+    "expect": [
+      "Write_error_other_than_nats_is_reported_with_its_cause"
+    ]
+  },
+  {
+    "id": "waiter-degrades-at-once",
+    "rule": "§5 waiter: a transient L2 error does not run a second factory beside a live owner (review 8)",
+    "file": "src/NatsDistributedCache/NatsCache.cs",
+    "find": "++failures <= MaxWaiterFailures",
+    "replace": "++failures <= 0",
+    "expect": [
+      "Waiter_rides_out_a_transient_error_instead_of_running_a_second_factory"
     ]
   }
 ]
