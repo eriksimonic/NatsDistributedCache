@@ -1,0 +1,77 @@
+using System.Text.Json;
+
+namespace NatsDistributedCache;
+
+/// <summary>Global cache options (design section 4).</summary>
+public sealed class NatsCacheOptions
+{
+    private readonly Dictionary<Type, int> _typeVersions = new();
+
+    /// <summary>Comma-separated NATS server URLs, used when no connection is supplied.</summary>
+    public string Url { get; set; } = "nats://localhost:4222";
+
+    /// <summary>Required store prefix: stores are named {Prefix}_cache, {Prefix}_locks, {Prefix}_notifications, {Prefix}_objects.</summary>
+    public string Prefix { get; set; } = "";
+
+    /// <summary>Identifies this node in entry headers and lock tokens.</summary>
+    public string NodeId { get; set; } = Environment.MachineName;
+
+    /// <summary>Default entry options for calls that pass none.</summary>
+    public CacheEntryOptions DefaultEntryOptions { get; set; } = CacheEntryOptions.Default;
+
+    /// <summary>Default failure mode; overridable per call.</summary>
+    public FailureMode FailureMode { get; set; } = FailureMode.Open;
+
+    /// <summary>Brotli-compress payloads above this size; 0 turns compression off.</summary>
+    public int CompressionThresholdBytes { get; set; } = 4096;
+
+    /// <summary>L1 size limit, counted in serialized bytes.</summary>
+    public long L1SizeLimitBytes { get; set; } = 64L * 1024 * 1024;
+
+    /// <summary>Values above this size (after compression) are stored in the Object Store and skip L1.</summary>
+    public int LargeValueThresholdBytes { get; set; } = 512 * 1024;
+
+    /// <summary>Delete-marker TTL on both KV buckets; at least 1 s.</summary>
+    public TimeSpan LimitMarkerTtl { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>Upper bound for any lease; the locks bucket MaxAge is twice this.</summary>
+    public TimeSpan MaxLeaseTtl { get; set; } = TimeSpan.FromSeconds(60);
+
+    /// <summary>MaxAge of the cache bucket: a safety net above any L2 TTL plus grace.</summary>
+    public TimeSpan CacheMaxAge { get; set; } = TimeSpan.FromHours(24);
+
+    /// <summary>Optional MaxBytes cap of the cache bucket; -1 = unlimited.</summary>
+    public long CacheMaxBytes { get; set; } = -1;
+
+    /// <summary>Retention of the notifications stream.</summary>
+    public TimeSpan NotificationsMaxAge { get; set; } = TimeSpan.FromMinutes(5);
+
+    /// <summary>Message cap of the notifications stream.</summary>
+    public long NotificationsMaxMsgs { get; set; } = 1_000_000;
+
+    /// <summary>Replicas of every store. 3 in production; 1 only for single-node tests.</summary>
+    public int Replicas { get; set; } = 3;
+
+    /// <summary>Default schema version, the last internal key segment (_s{n}).</summary>
+    public int SchemaVersion { get; set; } = 1;
+
+    /// <summary>Schema versions RemoveAsync deletes; add the previous one during a rolling deploy.</summary>
+    public int[] KnownSchemaVersions { get; set; } = [1];
+
+    /// <summary>JSON options of the default serializer; set a TypeInfoResolver to use source generation.</summary>
+    public JsonSerializerOptions JsonSerializerOptions { get; set; } = new(JsonSerializerDefaults.Web);
+
+    /// <summary>Overrides the schema version for values of type <typeparamref name="T"/>.</summary>
+    public NatsCacheOptions ForType<T>(int schemaVersion)
+    {
+        if (schemaVersion < 1) throw new ArgumentOutOfRangeException(nameof(schemaVersion), "Schema versions start at 1.");
+        _typeVersions[typeof(T)] = schemaVersion;
+        return this;
+    }
+
+    internal int SchemaVersionFor(Type type) =>
+        _typeVersions.TryGetValue(type, out var v) ? v : SchemaVersion;
+
+    internal IEnumerable<int> AllKnownSchemaVersions() =>
+        KnownSchemaVersions.Concat(_typeVersions.Values).Append(SchemaVersion).Distinct();
+}

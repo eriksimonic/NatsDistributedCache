@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFrameworks>netstandard2.1;net10.0</TargetFrameworks>
+    <RootNamespace>NatsDistributedCache.Extensions</RootNamespace>
+    <Description>Dependency injection and options binding for NatsDistributedCache.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../NatsDistributedCache/NatsDistributedCache.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.12" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="10.0.12" />
+    <PackageReference Include="Microsoft.Extensions.Options.ConfigurationExtensions" Version="10.0.12" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(TargetFramework)' == 'netstandard2.1'">
+    <Compile Include="../Shared/IsExternalInit.cs" Link="Shared/IsExternalInit.cs" />
+  </ItemGroup>
+</Project>

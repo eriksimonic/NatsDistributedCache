@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/NatsDistributedCache.Extensions/NatsDistributedCache.Extensions.csproj" />
+    <Project Path="src/NatsDistributedCache/NatsDistributedCache.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/NatsDistributedCache.IntegrationTests/NatsDistributedCache.IntegrationTests.csproj" />
+    <Project Path="tests/NatsDistributedCache.UnitTests/NatsDistributedCache.UnitTests.csproj" />
+  </Folder>
+</Solution>
