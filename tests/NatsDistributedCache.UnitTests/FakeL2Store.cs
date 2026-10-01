@@ -49,6 +49,9 @@ internal sealed class FakeL2Store : IL2Store
 
     public int DirectReads { get; private set; }
     public int LeaderReads { get; private set; }
+
+    /// <summary>Calls of LastSequenceAsync, which is also the recovery probe; counted even while unavailable.</summary>
+    public int LastSequenceCalls { get; private set; }
     public List<(string Key, ulong? Expected, WriteResult Result, IReadOnlyDictionary<string, string> Headers, TimeSpan NatsTtl)> Puts { get; } = [];
 
     public ValueTask<L2Entry?> ReadAsync(string key, bool leader, CancellationToken ct)
@@ -123,6 +126,13 @@ internal sealed class FakeL2Store : IL2Store
             await Task.Yield();
             yield return k;
         }
+    }
+
+    public ValueTask<ulong> LastSequenceAsync(CancellationToken ct)
+    {
+        lock (_gate) LastSequenceCalls++;
+        ThrowIfUnavailable();
+        lock (_gate) return new(_seq);
     }
 
     /// <summary>Test helper: a copy of <see cref="Puts"/> taken under the store's lock (background renewals append to it).</summary>

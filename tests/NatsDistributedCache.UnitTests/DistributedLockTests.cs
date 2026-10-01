@@ -10,7 +10,8 @@ public sealed class DistributedLockTests
     private static readonly TimeSpan Lease = TimeSpan.FromSeconds(12);
     private static readonly TimeSpan FactoryTimeout = TimeSpan.FromSeconds(10);
 
-    private readonly FakeTimeProvider _time = new(new DateTimeOffset(2026, 10, 1, 12, 0, 0, TimeSpan.Zero));
+    private readonly CountingTimeProvider _time = new(new DateTimeOffset(2026, 10, 1, 12, 0, 0, TimeSpan.Zero));
+    private int _timersAtLastAdvance;
     private readonly FakeL2Store _locks;
 
     public DistributedLockTests() => _locks = new FakeL2Store(_time);
@@ -19,8 +20,15 @@ public sealed class DistributedLockTests
 
     internal static async Task Eventually(Func<bool> condition, string what)
     {
-        for (var i = 0; i < 500 && !condition(); i++) await Task.Delay(10);
-        Assert.True(condition(), what);
+        // Assert the last evaluation: a condition with side effects (an L1 miss refills L1) may change on a re-check.
+        var ok = condition();
+        for (var i = 0; i < 500 && !ok; i++)
+        {
+            await Task.Delay(10);
+            ok = condition();
+        }
+
+        Assert.True(ok, what);
     }
 
     [Fact]
@@ -152,7 +160,9 @@ public sealed class DistributedLockTests
 
     private async Task AdvanceRenewal(TimeSpan by)
     {
-        await Task.Delay(20); // let the renewal loop arm its timer
+        // Let the renewal loop arm its next delay first; a loop that has stopped arms none, so give up after 200 ms.
+        for (var i = 0; i < 40 && _time.Timers <= _timersAtLastAdvance; i++) await Task.Delay(5);
+        _timersAtLastAdvance = _time.Timers;
         _time.Advance(by);
     }
 
@@ -233,7 +243,13 @@ public sealed class DistributedLockTests
     public async Task Renewal_stops_at_factory_timeout_plus_lease_so_a_hung_owner_hands_over_by_expiry()
     {
         var lease = (await Lock("a").TryAcquireAsync("k", Lease, FactoryTimeout, default)).Lease!.StartRenewal();
-        for (var i = 0; i < 12; i++) await AdvanceRenewal(TimeSpan.FromSeconds(4)); // 48 s
+        for (var i = 1; i <= 5; i++) // wait for each renewal, or a tick can land before the loop re-arms its timer
+        {
+            await AdvanceRenewal(TimeSpan.FromSeconds(4));
+            await Eventually(() => lease.Renewals == i, $"renewal {i}");
+        }
+
+        for (var i = 0; i < 7; i++) await AdvanceRenewal(TimeSpan.FromSeconds(4)); // 48 s
         await Task.Delay(50);
 
         // Renewals at 4..20 s (5 of them); the cap is 10 + 12 = 22 s, so the last TTL ran out at 32 s.
@@ -242,5 +258,47 @@ public sealed class DistributedLockTests
         Assert.NotNull((await Lock("b").TryAcquireAsync("k", Lease, FactoryTimeout, default)).Lease);
         await lease.DisposeAsync(); // stale release: a no-op
         Assert.Equal(L2Op.Put, _locks.Peek("k")!.Op);
+    }
+
+    [Fact]
+    public async Task Acquire_gives_up_after_three_publishes()
+    {
+        _locks.RejectWritesWith = WriteResult.WrongLastSequence; // every publish conflicts, the subject reads empty
+
+        var r = await Lock("a").TryAcquireAsync("k", Lease, FactoryTimeout, default).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Null(r.Lease);
+        Assert.Equal(DistributedLock.MaxAcquireAttempts, _locks.PutsSnapshot().Count);
+    }
+
+    [Fact]
+    public async Task Starting_renewal_twice_runs_one_loop()
+    {
+        var lease = (await Lock("a").TryAcquireAsync("k", Lease, FactoryTimeout, default)).Lease!;
+        lease.StartRenewal();
+        lease.StartRenewal();
+        await AdvanceRenewal(TimeSpan.FromSeconds(4));
+        await Eventually(() => lease.Renewals == 1, "renewed");
+        await Task.Delay(50);
+
+        Assert.Equal(2, _locks.PutsSnapshot().Count); // the acquire and one renewal
+        await lease.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Lease_lost_by_expiry_stops_renewing()
+    {
+        var lease = (await Lock("a").TryAcquireAsync("k", Lease, FactoryTimeout, default)).Lease!.StartRenewal();
+        _locks.Unavailable = true;
+        for (var i = 0; i < 60 && !lease.Lost; i++) await AdvanceRenewal(TimeSpan.FromMilliseconds(250));
+        Assert.True(lease.Lost);
+        _locks.Unavailable = false;
+        var puts = _locks.PutsSnapshot().Count;
+
+        for (var i = 0; i < 3; i++) await AdvanceRenewal(TimeSpan.FromSeconds(4));
+        await Task.Delay(50);
+
+        Assert.Equal(puts, _locks.PutsSnapshot().Count); // a lost lease never writes again
+        await lease.DisposeAsync();
     }
 }

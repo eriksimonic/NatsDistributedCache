@@ -1,0 +1,9 @@
+{
+  "stryker-config": {
+    "project": "NatsDistributedCache.csproj",
+    "test-runner": "mtp",
+    "coverage-analysis": "perTest",
+    "reporters": [ "html", "json", "progress" ],
+    "thresholds": { "high": 90, "low": 80, "break": 0 }
+  }
+}

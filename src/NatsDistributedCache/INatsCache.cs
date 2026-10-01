@@ -30,4 +30,10 @@ public interface INatsCache
 
     /// <summary>Deletes every key under the dot-separated <paramref name="prefix"/>, e.g. <c>orders.42</c>.</summary>
     ValueTask RemoveByTagAsync(string prefix, CancellationToken ct = default);
+
+    /// <summary>
+    /// Flushes L1 on every node (admin operation, e.g. after a restore); L2 is untouched. Publishes a <c>clear</c>
+    /// event; this node's L1 is flushed even when NATS is unavailable.
+    /// </summary>
+    ValueTask ClearAsync(CancellationToken ct = default);
 }

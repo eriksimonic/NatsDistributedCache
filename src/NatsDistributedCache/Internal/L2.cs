@@ -80,4 +80,7 @@ internal interface IL2Store
 
     /// <summary>Keys matching a KV filter such as <c>orders.42.&gt;</c>.</summary>
     IAsyncEnumerable<string> ListKeysAsync(string filter, CancellationToken ct);
+
+    /// <summary>The bucket stream's last sequence (StreamInfo); also serves as the recovery probe.</summary>
+    ValueTask<ulong> LastSequenceAsync(CancellationToken ct);
 }

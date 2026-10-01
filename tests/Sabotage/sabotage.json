@@ -1,0 +1,429 @@
+[
+  {
+    "id": "fence-newer-returns-own-value",
+    "rule": "§5 fence: a live newer head wins; the owner returns it, not its own value",
+    "file": "src/NatsDistributedCache/NatsCache.cs",
+    "find": "return new(newer, FactoryOutcome.FencedNewer, head.Revision);",
+    "replace": "return new(value, FactoryOutcome.FencedNewer, head.Revision);",
+    "expect": [
+      "Fenced_by_a_concurrent_set_returns_the_newer_value"
+    ]
+  },
+  {
+    "id": "fence-ignores-delete",
+    "rule": "§5 fence: a DEL head = fenced-del, never written over",
+    "file": "src/NatsDistributedCache/NatsCache.cs",
+    "find": "if (head.Op == L2Op.Delete)\n",
+    "replace": "if (head.Op == L2Op.Delete && false)\n",
+    "expect": [
+      "Fenced_by_a_concurrent_delete_returns_the_factory_result_uncached"
+    ]
+  },
+  {
+    "id": "fence-unknown-not-settled-by-msg-id",
+    "rule": "§5 fence: an Unknown outcome is settled by our Nats-Msg-Id at the head",
+    "file": "src/NatsDistributedCache/NatsCache.cs",
+    "find": "head?.Header(\"Nats-Msg-Id\") == r.MsgId",
+    "replace": "head?.Header(\"Nats-Msg-Id\") == \"never\"",
+    "expect": [
+      "Unknown_outcome_is_settled_by_the_msg_id_at_the_head_of_the_subject",
+      "Unknown_write_settled_by_our_msg_id_is_cached_and_publishes_set"
+    ]
+  },
+  {
+    "id": "fence-marker-expects-empty",
+    "rule": "§5 fence: a TTL marker is free; retry expecting the marker's revision",
+    "file": "src/NatsDistributedCache/NatsCache.cs",
+    "find": "if (head.Op is L2Op.Marker or L2Op.Purge) { expected = head.Revision; continue; }",
+    "replace": "if (head.Op is L2Op.Marker or L2Op.Purge) { expected = 0; continue; }",
+    "expect": [
+      "Ttl_marker_counts_as_free_and_the_write_expects_the_marker_revision",
+      "Fence_retry_after_the_entry_turned_into_a_marker_expects_the_marker_revision"
+    ]
+  },
+  {
+    "id": "fence-expired-put-expects-empty",
+    "rule": "§5 fence: a logically expired PUT is not a conflict; retry at its revision",
+    "file": "src/NatsDistributedCache/NatsCache.cs",
+    "find": "expected = head.Revision; // logically expired PUT: not a conflict",
+    "replace": "expected = 0; // sabotaged",
+    "expect": [
+      "Logically_expired_value_is_a_miss_and_the_write_fences_on_its_revision",
+      "Fence_retry_after_a_logically_expired_put_expects_its_revision"
+    ]
+  },
+  {
+    "id": "release-after-event",
+    "rule": "§5 release before event: the lock is released before set/fail is published",
+    "file": "src/NatsDistributedCache/NatsCache.cs",
+    "find": "            if (lease is not null) await EndLeaseAsync(lease).ConfigureAwait(false);\n            var outcome = error is not null",
+    "replace": "            var outcome = error is not null",
+    "append_after": "            Report(new FactoryCompletion(key, reason, token, attempt, outcome, result?.Revision ?? 0, startedAt, _time.GetUtcNow(), error));\n",
+    "append": "            if (lease is not null) await EndLeaseAsync(lease).ConfigureAwait(false);\n",
+    "expect": [
+      "Release_happens_before_the_event",
+      "Lock_is_released_before_set_and_fail_events_are_published"
+    ]
+  },
+  {
+    "id": "no-fail-event",
+    "rule": "§5/§7: an owner whose value did not reach L2 publishes fail so waiters take over",
+    "file": "src/NatsDistributedCache/NatsCache.cs",
+    "find": "await PublishAsync(EventOp.Fail, ik, 0).ConfigureAwait(false);",
+    "replace": "await Task.CompletedTask.ConfigureAwait(false);",
+    "expect": [
+      "Failed_factory_publishes_fail_and_the_waiter_takes_over_within_its_backoff"
+    ]
+  },
+  {
+    "id": "no-set-event-from-factory",
+    "rule": "§7: a committed factory write publishes set",
+    "file": "src/NatsDistributedCache/NatsCache.cs",
+    "find": "if (outcome == FactoryOutcome.Cached) await PublishAsync(EventOp.Set",
+    "replace": "if (outcome == FactoryOutcome.Cached && false) await PublishAsync(EventOp.Set",
+    "expect": [
+      "Waiter_is_woken_by_the_set_event_without_waiting_for_a_poll",
+      "Release_happens_before_the_event",
+      "Factory_outcomes_are_reported_after_the_write_and_release"
+    ]
+  },
+  {
+    "id": "l1-older-replaces-newer",
+    "rule": "§4/§7 L1 compare-on-revision: an older revision never replaces a newer one",
+    "file": "src/NatsDistributedCache/Internal/L1Store.cs",
+    "find": "existing.Revision > item.Revision) return false;",
+    "replace": "existing.Revision > item.Revision && false) return false;",
+    "expect": [
+      "An_older_revision_never_replaces_a_newer_one"
+    ]
+  },
+  {
+    "id": "l1-floor-ignored",
+    "rule": "§7 floor: a refill below the key's floor is refused",
+    "file": "src/NatsDistributedCache/Internal/L1Store.cs",
+    "find": "if (item.Revision != 0 && item.Revision < Floor(key)) return false;",
+    "replace": "",
+    "expect": [
+      "Evict_raises_a_floor_that_blocks_older_refills_but_not_newer",
+      "Delete_evicts_everywhere_and_the_high_water_revision_blocks_a_lagging_read",
+      "Remove_deletes_every_known_schema_version_and_blocks_stale_refills"
+    ]
+  },
+  {
+    "id": "set-event-evicts-newer",
+    "rule": "§7 rule 3: a set event evicts only an older copy",
+    "file": "src/NatsDistributedCache/Internal/L1Store.cs",
+    "find": "existing.Revision < revision) _cache.Remove(key);",
+    "replace": "existing.Revision < revision || true) _cache.Remove(key);",
+    "expect": [
+      "Own_and_late_events_never_evict_a_newer_copy"
+    ]
+  },
+  {
+    "id": "set-event-no-hwm",
+    "rule": "§7 HWM: a set event raises the key's high-water revision",
+    "file": "src/NatsDistributedCache/Internal/L1Store.cs",
+    "find": "existing.Revision < revision) _cache.Remove(key);\n            SetFloor(key, revision, floorTtl);",
+    "replace": "existing.Revision < revision) _cache.Remove(key);",
+    "expect": [
+      "Set_on_one_node_evicts_the_older_copy_on_another",
+      "Set_event_raises_the_floor_so_a_stale_direct_read_is_not_served"
+    ]
+  },
+  {
+    "id": "serve-no-hwm",
+    "rule": "§7 HWM on serve (I5): serving a revision raises the floor, so an older one is never served later",
+    "file": "src/NatsDistributedCache/NatsCache.cs",
+    "find": "_l1.RaiseFloor(entry.Key, entry.Revision, FloorTtl(o)); // HWM",
+    "replace": "// sabotaged HWM",
+    "expect": [
+      "Delete_evicts_everywhere_and_the_high_water_revision_blocks_a_lagging_read",
+      "Serving_a_revision_raises_the_floor_so_a_lagging_replica_cannot_serve_an_older_one"
+    ]
+  },
+  {
+    "id": "del-event-no-evict",
+    "rule": "§7: a del event evicts the key and sets a floor",
+    "file": "src/NatsDistributedCache/NatsCache.cs",
+    "find": "                _l1.Evict(e.Key, e.Rev, floorTtl);\n",
+    "replace": "",
+    "expect": [
+      "Delete_evicts_everywhere_and_the_high_water_revision_blocks_a_lagging_read"
+    ]
+  },
+  {
+    "id": "tag-event-no-evict",
+    "rule": "§7: a tag event evicts the prefix",
+    "file": "src/NatsDistributedCache/NatsCache.cs",
+    "find": "                _l1.EvictPrefix($\"{e.Key}.\", e.Rev, floorTtl);\n",
+    "replace": "",
+    "expect": [
+      "Tag_delete_evicts_the_prefix_on_other_nodes"
+    ]
+  },
+  {
+    "id": "clear-event-no-flush",
+    "rule": "§7: a clear event flushes L1",
+    "file": "src/NatsDistributedCache/NatsCache.cs",
+    "find": "            case EventOp.Clear:\n                _l1.Clear();\n",
+    "replace": "            case EventOp.Clear:\n",
+    "expect": [
+      "Clear_flushes_l1_on_every_node"
+    ]
+  },
+  {
+    "id": "gap-not-detected",
+    "rule": "§7 rule 7: a stream-sequence jump triggers the gap check",
+    "file": "src/NatsDistributedCache/Internal/NotificationListener.cs",
+    "find": "if (msg.StreamSeq > last + 1)",
+    "replace": "if (msg.StreamSeq > last + 1 && false)",
+    "expect": [
+      "Discarded_events_flush_l1",
+      "Sequence_gap_without_loss_resumes_and_applies_the_missed_events"
+    ]
+  },
+  {
+    "id": "discard-not-treated-as-loss",
+    "rule": "§7 rule 7: FirstSeq > lastSeen + 1 means events were lost: flush",
+    "file": "src/NatsDistributedCache/Internal/NotificationListener.cs",
+    "find": "else if (pos.FirstSeq > last + 1) reason",
+    "replace": "else if (pos.FirstSeq > last + 1 && false) reason",
+    "expect": [
+      "Discarded_events_flush_l1"
+    ]
+  },
+  {
+    "id": "recreate-not-treated-as-loss",
+    "rule": "§7 rule 7: a recreated stream means events were lost: flush",
+    "file": "src/NatsDistributedCache/Internal/NotificationListener.cs",
+    "find": "pos.Created != created) reason",
+    "replace": "pos.Created != created && false) reason",
+    "expect": [
+      "Reconnect_runs_the_gap_check_and_a_recreated_stream_flushes_l1",
+      "Recreated_stream_is_detected_even_when_it_already_holds_more_events"
+    ]
+  },
+  {
+    "id": "resume-from-new",
+    "rule": "§7 rule 7: without loss, resume from lastSeen + 1 (not from new)",
+    "file": "src/NatsDistributedCache/Internal/NotificationListener.cs",
+    "find": "var start = _lastSeen is { } seen ? seen + 1 : (ulong?)null;",
+    "replace": "var start = (ulong?)null;",
+    "expect": [
+      "Sequence_gap_without_loss_resumes_and_applies_the_missed_events"
+    ]
+  },
+  {
+    "id": "lease-no-cap",
+    "rule": "§5: renewal stops at FactoryTimeout + LeaseTtl, so a hung owner hands over",
+    "file": "src/NatsDistributedCache/Internal/DistributedLock.cs",
+    "find": "if (now >= stopAt)",
+    "replace": "if (now >= stopAt && false)",
+    "expect": [
+      "Renewal_stops_at_factory_timeout_plus_lease_so_a_hung_owner_hands_over_by_expiry"
+    ]
+  },
+  {
+    "id": "lease-renews-once-per-ttl",
+    "rule": "§5: renew every LeaseTtl / 3",
+    "file": "src/NatsDistributedCache/Internal/DistributedLock.cs",
+    "find": "var interval = TimeSpan.FromTicks(Token.Lease.Ticks / 3);",
+    "replace": "var interval = TimeSpan.FromTicks(Token.Lease.Ticks);",
+    "expect": [
+      "Renewal_every_third_of_the_lease_keeps_the_lock_and_release_expects_the_latest_revision"
+    ]
+  },
+  {
+    "id": "lost-lease-not-marked",
+    "rule": "§5: a renewal that finds another owner marks the lease lost",
+    "file": "src/NatsDistributedCache/Internal/DistributedLock.cs",
+    "find": "                    case RenewStatus.Lost:\n                        _lost = true;\n",
+    "replace": "                    case RenewStatus.Lost:\n",
+    "expect": [
+      "Renewal_that_finds_another_owner_marks_the_lease_lost_and_skips_the_release"
+    ]
+  },
+  {
+    "id": "single-flight-off",
+    "rule": "§5 local single-flight: callers on one node share one load",
+    "file": "src/NatsDistributedCache/Internal/SingleFlight.cs",
+    "find": "if (_inflight.TryGetValue(key, out var existing))",
+    "replace": "if (_inflight.TryGetValue(key + Guid.NewGuid(), out var existing))",
+    "expect": [
+      "Concurrent_callers_share_one_load",
+      "Concurrent_callers_on_one_node_run_the_factory_once"
+    ]
+  },
+  {
+    "id": "refresh-claimed-every-read",
+    "rule": "§6 early refresh: at most one refresh per L1 fill",
+    "file": "src/NatsDistributedCache/Internal/L1Store.cs",
+    "find": "public bool TryClaimRefresh() => Interlocked.Exchange(ref _refreshClaimed, 1) == 0;",
+    "replace": "public bool TryClaimRefresh() => Interlocked.Exchange(ref _refreshClaimed, 1) >= 0;",
+    "expect": [
+      "Early_refresh_serves_the_current_value_and_refreshes_once_in_the_background",
+      "One_l1_fill_starts_at_most_one_refresh_even_when_the_refresh_is_a_no_op"
+    ]
+  },
+  {
+    "id": "recovery-no-flush",
+    "rule": "§8 recovery: L1 is always flushed when NATS comes back",
+    "file": "src/NatsDistributedCache/NatsCache.cs",
+    "find": "_journal.Drain();\n        _l1.Clear();\n",
+    "replace": "_journal.Drain();\n",
+    "expect": [
+      "Outage_writes_are_replayed_as_fenced_deletes_on_recovery",
+      "Recovery_flushes_values_computed_locally_during_the_outage"
+    ]
+  },
+  {
+    "id": "recovery-deletes-newer-writes",
+    "rule": "§8 recovery: an entry written after the outage began is kept",
+    "file": "src/NatsDistributedCache/NatsCache.cs",
+    "find": "head.Created >= firstOutageWrite - OutageSkewMargin",
+    "replace": "head.Created >= firstOutageWrite + TimeSpan.FromDays(1)",
+    "expect": [
+      "Outage_writes_are_replayed_as_fenced_deletes_on_recovery"
+    ]
+  },
+  {
+    "id": "closed-mode-open",
+    "rule": "Q1: FailureMode.Closed throws when NATS is down",
+    "file": "src/NatsDistributedCache/NatsCache.cs",
+    "find": "if ((o?.FailureMode ?? _options.FailureMode) == FailureMode.Closed)",
+    "replace": "if ((o?.FailureMode ?? _options.FailureMode) == FailureMode.Closed && false)",
+    "expect": [
+      "Closed_mode_throws_when_l2_is_down"
+    ]
+  },
+  {
+    "id": "nats-ttl-no-grace",
+    "rule": "§6: Nats-TTL = L2Ttl + lease + FactoryTimeout grace",
+    "file": "src/NatsDistributedCache/Internal/Expiration.cs",
+    "find": "var natsTtl = TimeSpan.FromSeconds(Math.Ceiling((l2 + grace).TotalSeconds));",
+    "replace": "var natsTtl = TimeSpan.FromSeconds(Math.Ceiling(l2.TotalSeconds));",
+    "expect": [
+      "Nats_ttl_is_l2_ttl_plus_grace_rounded_up_to_seconds"
+    ]
+  },
+  {
+    "id": "jitter-positive-only",
+    "rule": "§6 jitter: uniform over ±j",
+    "file": "src/NatsDistributedCache/Internal/Expiration.cs",
+    "find": ": 1 + j * (2 * u - 1);",
+    "replace": ": 1 + j * u;",
+    "expect": [
+      "Jitter_is_uniform_over_the_window"
+    ]
+  },
+  {
+    "id": "decode-throws-on-malformed",
+    "rule": "§7: a malformed event is skipped, never crashes the consumer (owner's question on Decode)",
+    "file": "src/NatsDistributedCache/Internal/Notifications.cs",
+    "find": "catch (Exception ex) when (ex is JsonException or InvalidOperationException or FormatException)",
+    "replace": "catch (Exception ex) when (ex is NotSupportedException)",
+    "expect": [
+      "Event_round_trips_and_malformed_payloads_are_rejected"
+    ]
+  },
+  {
+    "id": "waiter-busy-loop",
+    "rule": "§5 waiter: park on the key's signal or the 250 ms poll, never spin on NATS",
+    "file": "src/NatsDistributedCache/NatsCache.cs",
+    "find": "        await Task.WhenAny(delay, signal).ConfigureAwait(false);\n",
+    "replace": "",
+    "expect": [
+      "Parked_waiter_does_not_poll_and_is_woken_by_del_tag_and_clear_events"
+    ]
+  },
+  {
+    "id": "recovery-loop-never-stops",
+    "rule": "§8 recovery: the probe loop ends after a successful recovery",
+    "file": "src/NatsDistributedCache/NatsCache.cs",
+    "find": "if (await RecoverAsync(ct).ConfigureAwait(false)) return;",
+    "replace": "await RecoverAsync(ct).ConfigureAwait(false);",
+    "expect": [
+      "Recovery_loop_probes_once_per_second_and_stops_after_recovering"
+    ]
+  },
+  {
+    "id": "shared-flight-key",
+    "rule": "§5 local single-flight is per key and type",
+    "file": "src/NatsDistributedCache/NatsCache.cs",
+    "find": "private static string FlightKey<T>(string ik) => $\"{ik}|{typeof(T).FullName}\";",
+    "replace": "private static string FlightKey<T>(string ik) => \"all\";",
+    "expect": [
+      "Different_keys_never_share_a_load"
+    ]
+  },
+  {
+    "id": "reconnect-ignored",
+    "rule": "§7 rule 7: a reconnect runs the gap check",
+    "file": "src/NatsDistributedCache/Internal/NotificationListener.cs",
+    "find": "_transport.Reconnected += OnReconnected;",
+    "replace": "_ = 0;",
+    "expect": [
+      "Reconnect_alone_triggers_the_gap_check_and_replays_missed_events"
+    ]
+  },
+  {
+    "id": "floor-shares-the-key",
+    "rule": "§7 floor: a key's floor is stored apart from its value (a static initializer Stryker cannot mutate)",
+    "file": "src/NatsDistributedCache/Internal/L1Store.cs",
+    "find": "private static readonly string FloorPrefix = \"\\u0001floor:\";",
+    "replace": "private static readonly string FloorPrefix = \"\";",
+    "expect": [
+      "Floor_survives_a_newer_entry_for_the_same_key"
+    ]
+  },
+  {
+    "id": "events-indented",
+    "rule": "§7 event format: compact JSON (a static initializer Stryker cannot mutate)",
+    "file": "src/NatsDistributedCache/Internal/Notifications.cs",
+    "find": "new() { Indented = false }",
+    "replace": "new() { Indented = true }",
+    "expect": [
+      "Event_round_trips_and_malformed_payloads_are_rejected"
+    ]
+  },
+  {
+    "id": "lease-not-raised-to-min",
+    "rule": "§5: the default lease is clamped to [MinLeaseTtl, MaxLeaseTtl]",
+    "file": "src/NatsDistributedCache/Internal/Expiration.cs",
+    "find": "return lease < _options.MinLeaseTtl ? _options.MinLeaseTtl : lease;",
+    "replace": "return lease;",
+    "expect": [
+      "Default_lease_is_raised_to_the_minimum"
+    ]
+  },
+  {
+    "id": "fence-two-attempts",
+    "rule": "§5 fence: up to three write attempts",
+    "file": "src/NatsDistributedCache/NatsCache.cs",
+    "find": "private const int MaxFenceAttempts = 3;",
+    "replace": "private const int MaxFenceAttempts = 2;",
+    "expect": [
+      "Fence_makes_at_most_three_attempts"
+    ]
+  },
+  {
+    "id": "leader-below-floor-served",
+    "rule": "§7: an entry still below the floor after the leader read is discarded",
+    "file": "src/NatsDistributedCache/NatsCache.cs",
+    "find": "return entry is not null && entry.Revision < floor ? null : entry;",
+    "replace": "return entry;",
+    "expect": [
+      "Entry_still_below_the_floor_after_the_leader_read_is_not_served"
+    ]
+  },
+  {
+    "id": "clear-subject-per-key",
+    "rule": "§7: clear and tag events go to their own subjects",
+    "file": "src/NatsDistributedCache/NatsCache.cs",
+    "find": "await _notify.PublishAsync(subject ?? NotifySubjects.ForKey(_options.Prefix, key),",
+    "replace": "await _notify.PublishAsync(NotifySubjects.ForKey(_options.Prefix, key),",
+    "expect": [
+      "Events_go_to_the_key_tag_and_clear_subjects"
+    ]
+  }
+]

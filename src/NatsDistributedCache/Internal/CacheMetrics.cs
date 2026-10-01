@@ -26,6 +26,12 @@ internal sealed class CacheMetrics : IDisposable
         LeasesLost = _meter.CreateCounter<long>("cache.lock.leases_lost");
         EarlyRefreshes = _meter.CreateCounter<long>("cache.early_refreshes");
         LockRejected = _meter.CreateCounter<long>("cache.lock.rejected");
+        EventsPublished = _meter.CreateCounter<long>("cache.events.published");
+        EventPublishFailures = _meter.CreateCounter<long>("cache.events.publish_failures");
+        EventsReceived = _meter.CreateCounter<long>("cache.events.received");
+        L1Flushes = _meter.CreateCounter<long>("cache.l1.flushes");
+        Outages = _meter.CreateCounter<long>("cache.outages");
+        Recovered = _meter.CreateCounter<long>("cache.recovered");
     }
 
     public Counter<long> L1Hits { get; }
@@ -43,6 +49,12 @@ internal sealed class CacheMetrics : IDisposable
     public Counter<long> LeasesLost { get; }
     public Counter<long> EarlyRefreshes { get; }
     public Counter<long> LockRejected { get; }
+    public Counter<long> EventsPublished { get; }
+    public Counter<long> EventPublishFailures { get; }
+    public Counter<long> EventsReceived { get; }
+    public Counter<long> L1Flushes { get; }
+    public Counter<long> Outages { get; }
+    public Counter<long> Recovered { get; }
 
     public void Dispose() => _meter.Dispose();
 }

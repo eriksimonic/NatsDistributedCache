@@ -70,6 +70,16 @@ public sealed class NatsCacheOptions
     /// <summary>JSON options of the default serializer; set a TypeInfoResolver to use source generation.</summary>
     public JsonSerializerOptions JsonSerializerOptions { get; set; } = new(JsonSerializerDefaults.Web);
 
+    /// <summary>
+    /// Called after every factory run with its outcome (cached, fenced, uncached, local-only or failed), after the
+    /// write and the lock release. Runs inline; exceptions are logged and swallowed. Used by the TestApi to feed the
+    /// Origin call ledger (design section 9).
+    /// </summary>
+    public Action<FactoryCompletion>? OnFactoryCompleted { get; set; }
+
+    /// <summary>Upper bound on keys and prefixes journaled while NATS is down (Open mode); beyond it L1 is still flushed on recovery.</summary>
+    public int OutageJournalCapacity { get; set; } = 100_000;
+
     /// <summary>Overrides the schema version for values of type <typeparamref name="T"/>.</summary>
     public NatsCacheOptions ForType<T>(int schemaVersion)
     {

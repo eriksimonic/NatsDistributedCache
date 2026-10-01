@@ -10,6 +10,7 @@ public sealed class SingleFlightLockTests : IAsyncDisposable
     private readonly FakeTimeProvider _time = new(new DateTimeOffset(2026, 10, 1, 12, 0, 0, TimeSpan.Zero));
     private readonly FakeL2Store _l2;
     private readonly FakeL2Store _locks;
+    private readonly FakeNotificationTransport _notify = new();
     private readonly List<NatsCache> _caches = [];
 
     public SingleFlightLockTests()
@@ -22,7 +23,7 @@ public sealed class SingleFlightLockTests : IAsyncDisposable
     {
         var o = new NatsCacheOptions { Prefix = "test", NodeId = node };
         configure?.Invoke(o);
-        var cache = new NatsCache(o, _l2, _locks, null, null, _time, null, new FixedRandom(0.5));
+        var cache = new NatsCache(o, _l2, _locks, _notify, null, null, _time, null, new FixedRandom(0.5));
         _caches.Add(cache);
         return cache;
     }
@@ -218,10 +219,12 @@ public sealed class SingleFlightLockTests : IAsyncDisposable
         var a = NewCache("a", c => c.DefaultEntryOptions = o);
         var reasons = new List<FactoryReason>();
         var version = 0;
-        Func<FactoryContext, CancellationToken, ValueTask<int>> factory = (c, _) =>
+        var refreshGate = new TaskCompletionSource();
+        Func<FactoryContext, CancellationToken, ValueTask<int>> factory = async (c, _) =>
         {
             lock (reasons) reasons.Add(c.Reason);
-            return new ValueTask<int>(Interlocked.Increment(ref version));
+            if (c.Reason == FactoryReason.EarlyRefresh) await refreshGate.Task; // finish only after the reads below
+            return Interlocked.Increment(ref version);
         };
 
         Assert.Equal(1, await a.GetOrCreateAsync("orders.1", factory));
@@ -231,6 +234,7 @@ public sealed class SingleFlightLockTests : IAsyncDisposable
 
         var hits = await Task.WhenAll(Enumerable.Range(0, 50).Select(_ => a.GetOrCreateAsync("orders.1", factory).AsTask()));
         Assert.All(hits, v => Assert.Equal(1, v)); // callers keep the current value
+        refreshGate.SetResult();
         await DistributedLockTests.Eventually(() => _l2.Puts.Count == 2, "refresh written");
         await DistributedLockTests.Eventually(() => _locks.Peek("orders.1._s1")?.Op == L2Op.Delete, "refresh lock released");
 

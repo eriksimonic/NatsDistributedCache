@@ -12,7 +12,6 @@ internal sealed class SingleFlight
     private readonly ConcurrentDictionary<string, Task<object?>> _inflight = new(StringComparer.Ordinal);
 
     public int InFlight => _inflight.Count;
-
     public async Task<T> RunAsync<T>(string key, Func<Task<T>> load, CancellationToken ct)
     {
         while (true)
@@ -26,18 +25,22 @@ internal sealed class SingleFlight
             _ = tcs.Task.ContinueWith(static t => _ = t.Exception, TaskContinuationOptions.OnlyOnFaulted); // observed
             _ = Task.Run(async () =>
             {
+                object? result = null;
+                Exception? error = null;
                 try
                 {
-                    tcs.TrySetResult(await load().ConfigureAwait(false));
+                    result = await load().ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
-                    tcs.TrySetException(ex);
+                    error = ex;
                 }
-                finally
-                {
-                    _inflight.TryRemove(key, out _);
-                }
+
+                // Leave the table before completing: a caller woken by this result that calls again must start a
+                // fresh load, not join this finished one (and get its failure instead of a retry).
+                _inflight.TryRemove(key, out _);
+                if (error is null) tcs.TrySetResult(result);
+                else tcs.TrySetException(error);
             }, CancellationToken.None);
             return (T)(await WaitAsync(tcs.Task, ct).ConfigureAwait(false))!;
         }

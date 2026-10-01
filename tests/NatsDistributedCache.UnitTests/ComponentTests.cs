@@ -42,7 +42,7 @@ public class L1StoreTests
 {
     private readonly FakeTimeProvider _time = new(new DateTimeOffset(2026, 9, 30, 12, 0, 0, TimeSpan.Zero));
 
-    private L1Item Item(object? value, ulong rev) => new(value, rev, _time.GetUtcNow().AddMinutes(1), 10);
+    private L1Item Item(string value, ulong rev) => new L1Item<string>(value, rev, _time.GetUtcNow().AddMinutes(1), 10);
 
     [Fact]
     public void An_older_revision_never_replaces_a_newer_one()
@@ -51,7 +51,8 @@ public class L1StoreTests
         Assert.True(l1.Set("k", Item("v2", 2), TimeSpan.FromMinutes(1)));
         Assert.False(l1.Set("k", Item("v1", 1), TimeSpan.FromMinutes(1)));
         Assert.True(l1.TryGet("k", out var item));
-        Assert.Equal("v2", item.Value);
+        Assert.True(item.TryGetValue<string>(out var v2));
+        Assert.Equal("v2", v2);
     }
 
     [Fact]

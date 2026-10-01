@@ -9,8 +9,10 @@ namespace NatsDistributedCache;
 
 /// <summary>
 /// The cache facade (design section 4): L1 → local single-flight → L2 → distributed lock → factory → fenced
-/// L2 write → release. Waiters on other nodes poll L2 and the lock key every 250 ms; invalidation events
-/// (milestone 4) and large values in the Object Store are not wired in yet; large values are returned uncached.
+/// L2 write → release → event. Every write publishes an invalidation event; one ordered consumer per node evicts
+/// L1 by revision and wakes lock waiters (section 7). In Open mode, writes made while NATS is down are journaled
+/// and replayed as fenced deletes on recovery (section 8). Large values in the Object Store are not wired in yet;
+/// they are returned uncached.
 /// </summary>
 public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
 {
@@ -24,6 +26,8 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
     private const int MaxFenceAttempts = 3;
     internal static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(250);
     private static readonly TimeSpan ReadyWait = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan RecoveryProbeInterval = TimeSpan.FromSeconds(1);
+    private static readonly TimeSpan OutageSkewMargin = TimeSpan.FromSeconds(1);
 
     private readonly NatsCacheOptions _options;
     private readonly IL2Store _l2;
@@ -42,9 +46,17 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
     private readonly CancellationToken _shutdownToken;
     private readonly System.Collections.Concurrent.ConcurrentDictionary<LockLease, byte> _activeLeases = new();
     private readonly object _startLock = new();
+    private readonly INotificationTransport? _notify;
+    private readonly NotificationListener? _listener;
+    private readonly KeySignals _signals = new();
+    private readonly OutageJournal _journal;
+    private readonly INatsConnection? _connection;
     private Task? _provisioning;
+    private Task? _recovery;
     private volatile bool _ready;
     private volatile Exception? _fatal;
+    private volatile bool _outage;
+    private DateTimeOffset _outageSince;
     private int _disposed;
 
     /// <summary>Creates a cache over <paramref name="connection"/>, or over a new connection to <see cref="NatsCacheOptions.Url"/>.</summary>
@@ -55,15 +67,16 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
         _ownedConnection = owned;
     }
 
-    private NatsCache(NatsCacheOptions options, (IL2Store L2, IL2Store Locks, Func<CancellationToken, ILogger, Task> Provision) nats,
+    private NatsCache(NatsCacheOptions options, NatsParts nats,
         ILoggerFactory? loggerFactory, TimeProvider? timeProvider, ICacheSerializer? serializer, IRandomSource random)
-        : this(options, nats.L2, nats.Locks, null, loggerFactory, timeProvider, serializer, random)
+        : this(options, nats.L2, nats.Locks, nats.Notify, null, loggerFactory, timeProvider, serializer, random)
     {
         _provision = ct => nats.Provision(ct, _logger);
+        _connection = nats.Connection;
     }
 
-    /// <summary>Test seam: a custom L2, locks bucket and provisioning step.</summary>
-    internal NatsCache(NatsCacheOptions options, IL2Store l2, IL2Store locks, Func<CancellationToken, Task>? provision,
+    /// <summary>Test seam: a custom L2, locks bucket, notifications stream and provisioning step.</summary>
+    internal NatsCache(NatsCacheOptions options, IL2Store l2, IL2Store locks, INotificationTransport? notify, Func<CancellationToken, Task>? provision,
         ILoggerFactory? loggerFactory, TimeProvider? timeProvider, ICacheSerializer? serializer, IRandomSource random)
     {
         Provisioner.ValidateOptions(options);
@@ -78,6 +91,9 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
         _shutdownToken = _shutdown.Token; // read once: the source is disposed on shutdown
         _l1 = new L1Store(options.L1SizeLimitBytes, _time);
         _provision = provision ?? (_ => Task.CompletedTask);
+        _journal = new OutageJournal(options.OutageJournalCapacity);
+        _notify = notify;
+        if (notify is not null) _listener = new NotificationListener(notify, HandleEvent, FlushAfterLostEvents, _logger);
     }
 
     /// <summary>True once the NATS stores are provisioned and verified.</summary>
@@ -85,6 +101,36 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
 
     /// <summary>Set when provisioning failed permanently (an existing store is unusable).</summary>
     public Exception? ProvisioningError => _fatal;
+
+    /// <summary>
+    /// Readiness (design section 8): Healthy while NATS is reachable and the stores are provisioned; otherwise
+    /// Degraded in FailureMode.Open (keep routing to the node) or Unavailable in FailureMode.Closed.
+    /// </summary>
+    public CacheHealth Health => HealthDescription is null
+        ? CacheHealth.Healthy
+        : _options.FailureMode == FailureMode.Open ? CacheHealth.Degraded : CacheHealth.Unavailable;
+
+    /// <summary>Why the node is not Healthy, or null when it is.</summary>
+    public string? HealthDescription
+    {
+        get
+        {
+            if (_fatal is { } fatal) return $"stores unusable: {fatal.Message}";
+            if (_connection is { ConnectionState: not NatsConnectionState.Open }) return $"NATS connection {_connection.ConnectionState}";
+            if (_outage) return $"NATS unavailable since {_outageSince:O}";
+            if (!_ready) return "stores not provisioned yet";
+            return null;
+        }
+    }
+
+    /// <summary>Completes once this node's notifications consumer is subscribed (tests and startup probes).</summary>
+    internal Task NotificationsLive => _listener?.Live ?? Task.CompletedTask;
+
+    /// <summary>Stream sequence of the last event this node applied (tests).</summary>
+    internal ulong? LastEventSeen => _listener?.LastSeen;
+
+    /// <summary>Keys with a parked waiter signal (tests: the table must not leak).</summary>
+    internal int PendingSignals => _signals.Count;
 
     /// <summary>Starts background provisioning; never blocks on NATS (design section 8).</summary>
     public void Start()
@@ -114,10 +160,10 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
     {
         CacheKeys.Validate(key);
         var ik = InternalKey<T>(key);
-        if (_l1.TryGet(ik, out var item) && (item.Value is T || (item.Value is null && default(T) is null)))
+        if (_l1.TryGet(ik, out var item) && item.TryGetValue<T>(out var hit))
         {
             _metrics.L1Hits.Add(1);
-            return new CacheResult<T>(true, (T?)item.Value, item.Revision);
+            return new CacheResult<T>(true, hit, item.Revision);
         }
 
         try
@@ -130,6 +176,7 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
         }
         catch (L2UnavailableException ex)
         {
+            EnterOutage(ex);
             ThrowIfClosed(null, ex);
             return default;
         }
@@ -146,14 +193,20 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
             var write = Prepare(value, o);
             if (write is null) { _l1.Evict(ik, 0, TimeSpan.Zero); return; }
             var r = await _l2.PutAsync(ik, write.Payload, write.Headers, write.Plan.NatsTtl, expected: null, ct).ConfigureAwait(false);
-            if (r.Status == WriteStatus.Committed) FillL1(ik, value, r.Seq, write, o);
+            if (r.Status == WriteStatus.Committed)
+            {
+                FillL1(ik, value, r.Seq, write, o);
+                await PublishAsync(EventOp.Set, ik, r.Seq).ConfigureAwait(false);
+            }
             else if (r.Status == WriteStatus.Unknown) throw new L2UnavailableException($"Set of '{key}' has an unknown outcome ({r.Error}).");
             else if (r.ErrCode != 0) HandleRejected(key, r);
         }
         catch (L2UnavailableException ex)
         {
+            EnterOutage(ex);
             ThrowIfClosed(o, ex);
-            // Open mode: L1 only. Outage writes are journaled and replayed as fenced deletes in milestone 4.
+            // Open mode: L1 only; journaled and replayed as a fenced delete on recovery (section 8).
+            _journal.RecordKey(ik, _time.GetUtcNow());
             DegradedFill(ik, value, o);
         }
     }
@@ -179,6 +232,7 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
             if (r.Status == WriteStatus.Committed)
             {
                 FillL1(ik, value, r.Seq, write, o);
+                await PublishAsync(EventOp.Set, ik, r.Seq).ConfigureAwait(false);
                 return true;
             }
 
@@ -188,6 +242,7 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
         }
         catch (L2UnavailableException ex)
         {
+            EnterOutage(ex);
             // A compare-and-swap cannot be emulated without L2, whatever the failure mode.
             throw new CacheUnavailableException($"UpdateAsync('{key}') needs NATS, which is unavailable.", ex);
         }
@@ -206,14 +261,23 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
                 var ik = CacheKeys.Internal(key, v);
                 var r = await _l2.DeleteAsync(ik, expected: null, ct).ConfigureAwait(false);
                 if (r.Status == WriteStatus.Unknown) throw new L2UnavailableException($"Remove of '{ik}' has an unknown outcome.");
-                if (r.Status == WriteStatus.Rejected) HandleRejected(key, r);
+                if (r.Status == WriteStatus.Rejected)
+                {
+                    HandleRejected(key, r);
+                    continue;
+                }
+
                 _l1.Evict(ik, r.Seq, floorTtl);
+                await PublishAsync(EventOp.Del, ik, r.Seq).ConfigureAwait(false);
             }
         }
         catch (L2UnavailableException ex)
         {
+            EnterOutage(ex);
             foreach (var v in versions) _l1.Evict(CacheKeys.Internal(key, v), 0, TimeSpan.Zero);
             ThrowIfClosed(null, ex);
+            var now = _time.GetUtcNow();
+            foreach (var v in versions) _journal.RecordKey(CacheKeys.Internal(key, v), now);
         }
     }
 
@@ -233,11 +297,32 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
                 if (r.Seq > highest) highest = r.Seq;
             }
 
+            // No key matched: the bucket's last sequence still gives the prefix floor a revision that blocks lagging reads.
+            if (highest == 0) highest = await _l2.LastSequenceAsync(ct).ConfigureAwait(false);
             _l1.EvictPrefix($"{prefix}.", highest, floorTtl);
+            await PublishAsync(EventOp.Tag, prefix, highest, NotifySubjects.ForTag(_options.Prefix, prefix)).ConfigureAwait(false);
         }
         catch (L2UnavailableException ex)
         {
+            EnterOutage(ex);
             _l1.EvictPrefix($"{prefix}.", 0, TimeSpan.Zero);
+            ThrowIfClosed(null, ex);
+            _journal.RecordPrefix(prefix, _time.GetUtcNow());
+        }
+    }
+
+    public async ValueTask ClearAsync(CancellationToken ct = default)
+    {
+        _l1.Clear();
+        _signals.PulseAll();
+        try
+        {
+            await EnsureReadyAsync(ct).ConfigureAwait(false);
+            await PublishAsync(EventOp.Clear, "*", 0, NotifySubjects.Clear(_options.Prefix)).ConfigureAwait(false);
+        }
+        catch (L2UnavailableException ex)
+        {
+            EnterOutage(ex);
             ThrowIfClosed(null, ex);
         }
     }
@@ -263,6 +348,13 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
             catch (OperationCanceledException) { }
         }
 
+        if (_recovery is { } rec)
+        {
+            try { await rec.ConfigureAwait(false); }
+            catch (OperationCanceledException) { }
+        }
+
+        if (_listener is not null) await _listener.DisposeAsync().ConfigureAwait(false);
         _l1.Dispose();
         _metrics.Dispose();
         if (_ownedConnection is not null) await _ownedConnection.DisposeAsync().ConfigureAwait(false);
@@ -306,7 +398,7 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
                 lease = waited.Lease;
                 if (lease is null)
                 {
-                    // LockWaitTimeout with no renewing owner (design section 5, waiter step 4): FailureMode applies.
+                    // Past LockWaitTimeout and the owner's bound (design section 5, waiter step 4): FailureMode applies.
                     _metrics.LockWaitTimeouts.Add(1);
                     ThrowIfClosed(o, new TimeoutException($"Waited for another node's factory for '{key}' past LockWaitTimeout ({o.LockWaitTimeout}) and the owner's bound."),
                         $"Timed out waiting for the distributed lock on '{key}' and FailureMode is Closed.");
@@ -353,26 +445,58 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
         }
 
         _metrics.Misses.Add(1);
+        return await RunOwnedAsync(key, ik, factory, o, reason, attempt, lease, head?.Revision ?? 0).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Factory → fenced write → release → event (design section 5): the release completes before the <c>set</c> or
+    /// <c>fail</c> event, so a waiter woken by the event never sees a live token. A held lock whose result did not
+    /// reach L2 (factory failed, fenced by a delete, uncacheable) publishes <c>fail</c>, so waiters retry at once.
+    /// </summary>
+    private async Task<T> RunOwnedAsync<T>(string key, string ik, Func<FactoryContext, CancellationToken, ValueTask<T>> factory,
+        CacheEntryOptions o, FactoryReason reason, int attempt, LockLease? lease, ulong expected)
+    {
+        var token = lease?.Token.ToString();
+        var startedAt = _time.GetUtcNow();
+        Fenced<T>? result = null;
+        Exception? error = null;
         try
         {
             lease?.StartRenewal();
-            var value = await RunFactoryAsync(key, factory, reason, lease?.Token.ToString(), attempt, o).ConfigureAwait(false);
+            T value;
             try
             {
-                return await WriteFencedAsync(ik, value, head?.Revision ?? 0, o).ConfigureAwait(false);
+                value = await RunFactoryAsync(key, factory, reason, token, attempt, o).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                error = ex;
+                throw;
+            }
+
+            try
+            {
+                result = await WriteFencedAsync(ik, value, expected, o).ConfigureAwait(false);
             }
             catch (L2UnavailableException ex)
             {
                 lease?.Abandon(); // NATS is unreachable: skip the release (it would take as long to fail); the lease expires
+                EnterOutage(ex);
                 ThrowIfClosed(o, ex);
                 DegradedFill(ik, value, o);
-                return value;
+                result = new Fenced<T>(value, FactoryOutcome.LocalOnly, 0);
             }
+
+            return result.Value.Value;
         }
         finally
         {
-            // Released after the write, so a waiter that sees the lock free also finds the value (or none, if the factory failed).
             if (lease is not null) await EndLeaseAsync(lease).ConfigureAwait(false);
+            var outcome = error is not null ? FactoryOutcome.Failed : result?.Outcome ?? FactoryOutcome.Failed;
+            if (outcome == FactoryOutcome.Cached) await PublishAsync(EventOp.Set, ik, result!.Value.Revision).ConfigureAwait(false);
+            else if (lease is not null && outcome is not (FactoryOutcome.FencedNewer or FactoryOutcome.LocalOnly))
+                await PublishAsync(EventOp.Fail, ik, 0).ConfigureAwait(false);
+            Report(new FactoryCompletion(key, reason, token, attempt, outcome, result?.Revision ?? 0, startedAt, _time.GetUtcNow(), error));
         }
     }
 
@@ -392,12 +516,12 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
     private readonly record struct WaitOutcome<T>(bool Found, T Value, LockLease? Lease, int Attempt);
 
     /// <summary>
-    /// Waiter (design section 5, v1.3): poll L2 and the lock key (leader read) every 250 ms. A value = done. A free
-    /// lock (the owner released after failing, or its lease expired) = retry the acquire after a 10–50 ms random
-    /// backoff; winning it is a takeover. A live token proves its owner renewed within one lease, so the waiter keeps
-    /// waiting while one is held, past LockWaitTimeout, up to the owner's bound: FactoryTimeout + 2 × LeaseTtl after
-    /// first seeing that owner (owners stop renewing FactoryTimeout + LeaseTtl after acquiring, so the lock is free
-    /// by then). FailureMode applies only past both LockWaitTimeout and that bound.
+    /// Waiter (design section 5, v1.3): park on the key's local signal, which the notifications consumer pulses on
+    /// the key's set, del or fail event, with a 250 ms poll as the fallback; then check L2 and the lock key (leader
+    /// read). A value = done. A free lock (the owner released after failing, or its lease expired) = retry the
+    /// acquire after a 10–50 ms random backoff; winning it is a takeover. A live token proves its owner renewed
+    /// within one lease, so the waiter keeps waiting while one is held, past LockWaitTimeout, up to the owner's
+    /// bound: FactoryTimeout + 2 × LeaseTtl after first seeing that owner. FailureMode applies only past both.
     /// </summary>
     private async Task<WaitOutcome<T>> WaitForOwnerAsync<T>(string ik, CacheEntryOptions o, TimeSpan leaseTtl, L2Entry? holder)
     {
@@ -419,28 +543,46 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
         }
 
         Observe(holder);
-        while (true)
+        var signal = _signals.Next(ik); // taken before the first wait, so an event during the acquire still wakes us
+        try
         {
-            await _time.DelayAsync(PollInterval, _shutdownToken).ConfigureAwait(false);
-            if (TryUse<T>(await ReadAboveFloorAsync(ik, CancellationToken.None).ConfigureAwait(false), o, out var value))
-                return new(true, value, null, 0);
-
-            // Leader read: a lagging replica must not hide a free lock (or keep showing a released one).
-            var lk = await _lock.ReadAsync(ik, leader: true, CancellationToken.None).ConfigureAwait(false);
-            if (!DistributedLock.IsHeld(lk))
+            while (true)
             {
-                await _time.DelayAsync(TimeSpan.FromMilliseconds(10 + 40 * _random.NextDouble()), _shutdownToken).ConfigureAwait(false);
-                var r = await _lock.TryAcquireAsync(ik, leaseTtl, o.FactoryTimeout, CancellationToken.None).ConfigureAwait(false);
-                if (r.Lease is not null) return new(false, default!, r.Lease, Math.Max(owners, 1) + 1);
-                lk = r.Holder;
-            }
+                await WaitForSignalOrPollAsync(signal).ConfigureAwait(false);
+                signal = _signals.Next(ik); // re-armed before reading, so an event during the reads is not missed
+                if (TryUse<T>(await ReadAboveFloorAsync(ik, CancellationToken.None).ConfigureAwait(false), o, out var value))
+                    return new(true, value, null, 0);
 
-            Observe(lk);
-            var now = _time.GetUtcNow();
-            if (now < deadline) continue;
-            if (DistributedLock.IsHeld(lk) && now < ownerBound) continue; // a live owner: keep waiting
-            return new(false, default!, null, 0);
+                // Leader read: a lagging replica must not hide a free lock (or keep showing a released one).
+                var lk = await _lock.ReadAsync(ik, leader: true, CancellationToken.None).ConfigureAwait(false);
+                if (!DistributedLock.IsHeld(lk))
+                {
+                    await _time.DelayAsync(TimeSpan.FromMilliseconds(10 + 40 * _random.NextDouble()), _shutdownToken).ConfigureAwait(false);
+                    var r = await _lock.TryAcquireAsync(ik, leaseTtl, o.FactoryTimeout, CancellationToken.None).ConfigureAwait(false);
+                    if (r.Lease is not null) return new(false, default!, r.Lease, Math.Max(owners, 1) + 1);
+                    lk = r.Holder;
+                }
+
+                Observe(lk);
+                var now = _time.GetUtcNow();
+                if (now < deadline) continue;
+                if (DistributedLock.IsHeld(lk) && now < ownerBound) continue; // a live owner: keep waiting
+                return new(false, default!, null, 0);
+            }
         }
+        finally
+        {
+            _signals.Forget(ik, signal);
+        }
+    }
+
+    private async Task WaitForSignalOrPollAsync(Task signal)
+    {
+        using var poll = CancellationTokenSource.CreateLinkedTokenSource(_shutdownToken);
+        var delay = _time.DelayAsync(PollInterval, poll.Token);
+        await Task.WhenAny(delay, signal).ConfigureAwait(false);
+        poll.Cancel(); // stop the poll timer when the event came first
+        _shutdownToken.ThrowIfCancellationRequested();
     }
 
     // ------------------------------------------------------------------ early refresh
@@ -480,27 +622,28 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
         if (acquired.Lease is not { } lease) return false; // another node refreshes or loads: a no-op, keep serving
 
         _activeLeases.TryAdd(lease, 0);
+        _metrics.LocksAcquired.Add(1);
+        L2Entry? head;
         try
         {
-            _metrics.LocksAcquired.Add(1);
-            var head = await _l2.ReadAsync(ik, leader: true, CancellationToken.None).ConfigureAwait(false);
-            if (head is { Op: L2Op.Put } && head.Revision > revision && TryUse<T>(head, o, out _)) return false; // already refreshed
-
-            _metrics.EarlyRefreshes.Add(1);
-            lease.StartRenewal();
-            var value = await RunFactoryAsync(key, factory, FactoryReason.EarlyRefresh, lease.Token.ToString(), 1, o).ConfigureAwait(false);
-            await WriteFencedAsync(ik, value, head?.Revision ?? 0, o).ConfigureAwait(false);
-            return true;
+            head = await _l2.ReadAsync(ik, leader: true, CancellationToken.None).ConfigureAwait(false);
         }
-        catch (L2UnavailableException)
+        catch
         {
             lease.Abandon();
+            await EndLeaseAsync(lease).ConfigureAwait(false);
             throw;
         }
-        finally
+
+        if (head is { Op: L2Op.Put } && head.Revision > revision && TryUse<T>(head, o, out _))
         {
             await EndLeaseAsync(lease).ConfigureAwait(false);
+            return false; // already refreshed
         }
+
+        _metrics.EarlyRefreshes.Add(1);
+        await RunOwnedAsync(key, ik, factory, o, FactoryReason.EarlyRefresh, 1, lease, head?.Revision ?? 0).ConfigureAwait(false);
+        return true;
     }
 
     /// <summary>
@@ -517,15 +660,17 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
         return entry is not null && entry.Revision < floor ? null : entry;
     }
 
+    private readonly record struct Fenced<T>(T Value, FactoryOutcome Outcome, ulong Revision);
+
     /// <summary>
     /// Fence rule (design section 5): write expecting <paramref name="expected"/>. On 10071 read the leader:
     /// empty, marker, purge or a logically expired value = not a conflict, retry with that revision; DEL =
     /// fenced, return the factory result uncached; live newer value = fenced, return it. At most 3 attempts.
     /// </summary>
-    private async Task<T> WriteFencedAsync<T>(string ik, T value, ulong expected, CacheEntryOptions o)
+    private async Task<Fenced<T>> WriteFencedAsync<T>(string ik, T value, ulong expected, CacheEntryOptions o)
     {
         var write = Prepare(value, o);
-        if (write is null) return value;
+        if (write is null) return new(value, FactoryOutcome.Uncached, 0);
 
         for (var attempt = 1; attempt <= MaxFenceAttempts; attempt++)
         {
@@ -533,20 +678,17 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
             if (r.Status == WriteStatus.Committed)
             {
                 FillL1(ik, value, r.Seq, write, o);
-                return value;
+                return new(value, FactoryOutcome.Cached, r.Seq);
             }
 
             if (r.Status == WriteStatus.Rejected && !r.IsWrongLastSequence)
-            {
-                HandleRejected(ik, r);
-                return value;
-            }
+                return new(value, HandleRejected(ik, r) ? FactoryOutcome.UncachedL2Full : FactoryOutcome.Uncached, 0);
 
             var head = await _l2.ReadAsync(ik, leader: true, CancellationToken.None).ConfigureAwait(false);
             if (r.Status == WriteStatus.Unknown && head?.Header("Nats-Msg-Id") == r.MsgId)
             {
                 FillL1(ik, value, head.Revision, write, o);
-                return value;
+                return new(value, FactoryOutcome.Cached, head.Revision);
             }
 
             if (head is null) { expected = 0; continue; }
@@ -554,29 +696,42 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
             if (head.Op == L2Op.Delete)
             {
                 _metrics.FencedWrites.Add(1, new KeyValuePair<string, object?>("outcome", "fenced-del"));
-                return value;
+                return new(value, FactoryOutcome.FencedDel, 0);
             }
 
             if (TryUse<T>(head, o, out var newer))
             {
                 _metrics.FencedWrites.Add(1, new KeyValuePair<string, object?>("outcome", "fenced-newer"));
-                return newer;
+                return new(newer, FactoryOutcome.FencedNewer, head.Revision);
             }
 
             expected = head.Revision; // logically expired PUT: not a conflict
         }
 
         _metrics.FencedWrites.Add(1, new KeyValuePair<string, object?>("outcome", "fenced-exhausted"));
-        return value;
+        return new(value, FactoryOutcome.FencedExhausted, 0);
     }
 
     private async Task<T> DegradedAsync<T>(string key, string ik, Func<FactoryContext, CancellationToken, ValueTask<T>> factory, CacheEntryOptions o, Exception cause)
     {
+        EnterOutage(cause);
         ThrowIfClosed(o, cause);
         _metrics.Degraded.Add(1);
         _logger.LogWarning(cause, "L2 unavailable; running the factory for {Key} locally (FailureMode.Open)", key);
-        var value = await RunFactoryAsync(key, factory, FactoryReason.Degraded, null, 1, o).ConfigureAwait(false);
+        var startedAt = _time.GetUtcNow();
+        T value;
+        try
+        {
+            value = await RunFactoryAsync(key, factory, FactoryReason.Degraded, null, 1, o).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Report(new FactoryCompletion(key, FactoryReason.Degraded, null, 1, FactoryOutcome.Failed, 0, startedAt, _time.GetUtcNow(), ex));
+            throw;
+        }
+
         DegradedFill(ik, value, o);
+        Report(new FactoryCompletion(key, FactoryReason.Degraded, null, 1, FactoryOutcome.LocalOnly, 0, startedAt, _time.GetUtcNow(), null));
         return value;
     }
 
@@ -586,6 +741,20 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
         _metrics.FactoryCalls.Add(1, new KeyValuePair<string, object?>("reason", reason.ToString()));
         using var timeout = new CancellationTokenSource(o.FactoryTimeout);
         return await factory(new FactoryContext(key, reason, lockToken, attempt), timeout.Token).ConfigureAwait(false);
+    }
+
+    private void Report(FactoryCompletion completion)
+    {
+        var hook = _options.OnFactoryCompleted;
+        if (hook is null) return;
+        try
+        {
+            hook(completion);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "OnFactoryCompleted threw for {Key}", completion.Key);
+        }
     }
 
     // ------------------------------------------------------------------ entries
@@ -636,7 +805,8 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
             var raw = PayloadCodec.Decode(entry.Payload, entry.Header(HeaderEncoding));
             value = _serializer.Deserialize<T>(raw)!;
             var ttl = _expiration.PlanL1(o, now, expiry);
-            _l1.Set(entry.Key, new L1Item(value, entry.Revision, now + ttl, raw.Length, RefreshAt(o, expiry, TimeSpan.FromMilliseconds(ttlMs))), ttl);
+            _l1.Set(entry.Key, new L1Item<T>(value, entry.Revision, now + ttl, raw.Length, RefreshAt(o, expiry, TimeSpan.FromMilliseconds(ttlMs))), ttl);
+            _l1.RaiseFloor(entry.Key, entry.Revision, FloorTtl(o)); // HWM: never serve an older revision later (I5)
             return true;
         }
         catch (Exception ex) when (ex is not OutOfMemoryException)
@@ -648,11 +818,7 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
 
     private bool TryL1<T>(string ik, out T value, out L1Item item)
     {
-        if (_l1.TryGet(ik, out item) && (item.Value is T || (item.Value is null && default(T) is null)))
-        {
-            value = (T)item.Value!;
-            return true;
-        }
+        if (_l1.TryGet(ik, out item) && item.TryGetValue(out value)) return true;
 
         value = default!;
         return false;
@@ -668,7 +834,8 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
     {
         var now = _time.GetUtcNow();
         var ttl = _expiration.PlanL1(o, now, now + write.Plan.L2Ttl);
-        _l1.Set(ik, new L1Item(value, revision, now + ttl, write.Size, RefreshAt(o, now + write.Plan.L2Ttl, write.Plan.L2Ttl)), ttl);
+        _l1.Set(ik, new L1Item<T>(value, revision, now + ttl, write.Size, RefreshAt(o, now + write.Plan.L2Ttl, write.Plan.L2Ttl)), ttl);
+        _l1.RaiseFloor(ik, revision, FloorTtl(o));
     }
 
     private void DegradedFill<T>(string ik, T value, CacheEntryOptions o)
@@ -676,19 +843,21 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
         if (value is null && o.CacheNullFor is null) return;
         var now = _time.GetUtcNow();
         var ttl = _expiration.PlanL1(o, now, now + (value is null ? o.CacheNullFor!.Value : o.L2Ttl));
-        _l1.Set(ik, new L1Item(value, 0, now + ttl, 1), ttl);
+        _l1.Set(ik, new L1Item<T>(value, 0, now + ttl, 1), ttl);
     }
 
-    private void HandleRejected(string key, WriteResult r)
+    /// <summary>Logs a rejected write; true when the cache bucket is full.</summary>
+    private bool HandleRejected(string key, WriteResult r)
     {
         if (r.ErrCode == 10077 || (r.Error?.IndexOf("maximum bytes", StringComparison.OrdinalIgnoreCase) ?? -1) >= 0)
         {
             _metrics.L2Full.Add(1);
             _logger.LogWarning("Cache bucket is full; {Key} served uncached ({Error})", key, r.Error);
-            return;
+            return true;
         }
 
         _logger.LogWarning("L2 rejected the write of {Key}: {Code} {Error}", key, r.ErrCode, r.Error);
+        return false;
     }
 
     private TimeSpan FloorTtl(CacheEntryOptions o) => TimeSpan.FromTicks((long)(o.L1Ttl.Ticks * (1 + o.JitterRatio))) + TimeSpan.FromSeconds(1);
@@ -699,6 +868,180 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
     {
         if ((o?.FailureMode ?? _options.FailureMode) == FailureMode.Closed)
             throw new CacheUnavailableException(message ?? "NATS is unavailable and FailureMode is Closed.", cause);
+    }
+
+    // ------------------------------------------------------------------ invalidation events (section 7)
+
+    /// <summary>Publishes an event; best effort: a failure is logged and counted, and L1Ttl bounds the staleness.</summary>
+    private async Task PublishAsync(EventOp op, string key, ulong rev, string? subject = null)
+    {
+        if (_notify is null) return;
+        var e = new CacheEvent(op, key, rev, _options.NodeId, _time.GetUtcNow().ToUnixTimeMilliseconds());
+        try
+        {
+            await _notify.PublishAsync(subject ?? NotifySubjects.ForKey(_options.Prefix, key), e.Encode(), Guid.NewGuid().ToString("N"), CancellationToken.None).ConfigureAwait(false);
+            _metrics.EventsPublished.Add(1, new KeyValuePair<string, object?>("op", op.ToString()));
+        }
+        catch (Exception ex)
+        {
+            _metrics.EventPublishFailures.Add(1);
+            _logger.LogWarning(ex, "Publishing the {Op} event for {Key} failed; other nodes converge within L1Ttl", op, key);
+        }
+    }
+
+    /// <summary>
+    /// Consumer rules 2–6 (design section 7). Own events are handled like any other: every L1 change compares
+    /// revisions, so they are harmless. Waiters parked on the key are woken by set, del and fail.
+    /// </summary>
+    private void HandleEvent(CacheEvent e)
+    {
+        _metrics.EventsReceived.Add(1, new KeyValuePair<string, object?>("op", e.Op.ToString()));
+        var floorTtl = FloorTtl(_options.DefaultEntryOptions);
+        switch (e.Op)
+        {
+            case EventOp.Set:
+                _l1.Invalidate(e.Key, e.Rev, floorTtl); // evict only if older; HWM = rev
+                _signals.Pulse(e.Key);
+                break;
+            case EventOp.Del:
+                _l1.Evict(e.Key, e.Rev, floorTtl);
+                _signals.Pulse(e.Key);
+                break;
+            case EventOp.Fail:
+                _signals.Pulse(e.Key);
+                break;
+            case EventOp.Tag:
+                _l1.EvictPrefix($"{e.Key}.", e.Rev, floorTtl);
+                _signals.PulsePrefix($"{e.Key}.");
+                break;
+            case EventOp.Clear:
+                _l1.Clear();
+                _signals.PulseAll();
+                break;
+        }
+    }
+
+    private void FlushAfterLostEvents(string reason)
+    {
+        _metrics.L1Flushes.Add(1, new KeyValuePair<string, object?>("reason", "lost-events"));
+        _l1.Clear();
+        _signals.PulseAll();
+    }
+
+    // ------------------------------------------------------------------ outage and recovery (section 8)
+
+    /// <summary>Marks the node as cut off from NATS and starts the recovery probe once.</summary>
+    private void EnterOutage(Exception cause)
+    {
+        if (_disposed == 1) return;
+        lock (_startLock)
+        {
+            if (_outage) return;
+            _outage = true;
+            _outageSince = _time.GetUtcNow();
+            _metrics.Outages.Add(1);
+            _logger.LogWarning(cause, "NATS unavailable; the cache runs degraded ({Mode})", _options.FailureMode);
+            if (_recovery is null || _recovery.IsCompleted) _recovery = Task.Run(() => RecoveryLoopAsync(_shutdownToken));
+        }
+    }
+
+    /// <summary>Probes L2 every second; on success flushes L1 and replays the outage journal (recovery step 2).</summary>
+    private async Task RecoveryLoopAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                await _time.DelayAsync(RecoveryProbeInterval, ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+
+            if (_fatal is not null) return; // unusable stores never recover by themselves
+            try
+            {
+                await EnsureReadyAsync(ct).ConfigureAwait(false);
+                await _l2.LastSequenceAsync(ct).ConfigureAwait(false);
+                if (await RecoverAsync(ct).ConfigureAwait(false)) return;
+            }
+            catch (L2UnavailableException)
+            {
+                // still down
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                return;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Recovery attempt failed; retrying");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Recovery step 2: L1 always flushes (outage values were L1-only). Every key written during the outage is re-read
+    /// through the leader; if its entry is older than the node's first outage write for it minus 1 s of skew margin,
+    /// it is deleted at that revision (fenced) plus a del event, otherwise skipped because someone wrote after the
+    /// outage began. Returns false (journal restored) when NATS drops again mid-replay.
+    /// </summary>
+    private async Task<bool> RecoverAsync(CancellationToken ct)
+    {
+        var (keys, prefixes, overflowed) = _journal.Drain();
+        _l1.Clear();
+        _signals.PulseAll();
+        _metrics.L1Flushes.Add(1, new KeyValuePair<string, object?>("reason", "recovery"));
+        var deleted = 0;
+        var pending = new List<KeyValuePair<string, DateTimeOffset>>(keys);
+        var pendingPrefixes = new List<KeyValuePair<string, DateTimeOffset>>(prefixes);
+        try
+        {
+            while (pending.Count > 0)
+            {
+                var k = pending[pending.Count - 1];
+                if (await ReplayKeyAsync(k.Key, k.Value, ct).ConfigureAwait(false)) deleted++;
+                pending.RemoveAt(pending.Count - 1);
+            }
+
+            while (pendingPrefixes.Count > 0)
+            {
+                var p = pendingPrefixes[pendingPrefixes.Count - 1];
+                await foreach (var ik in _l2.ListKeysAsync($"{p.Key}.>", ct).ConfigureAwait(false))
+                {
+                    if (await ReplayKeyAsync(ik, p.Value, ct).ConfigureAwait(false)) deleted++;
+                }
+
+                pendingPrefixes.RemoveAt(pendingPrefixes.Count - 1);
+            }
+        }
+        catch (L2UnavailableException)
+        {
+            _journal.Restore(pending, pendingPrefixes);
+            return false;
+        }
+
+        if (overflowed)
+            _logger.LogError("The outage journal overflowed ({Capacity} entries); some outage writes were not replayed and other nodes may serve pre-outage values until they expire", _options.OutageJournalCapacity);
+        var duration = _time.GetUtcNow() - _outageSince;
+        lock (_startLock) _outage = false;
+        _metrics.Recovered.Add(1);
+        _logger.LogInformation("NATS recovered after {Duration}; L1 flushed, {Deleted} outage write(s) replayed as fenced deletes", duration, deleted);
+        if (!_journal.IsEmpty) EnterOutage(new L2UnavailableException("writes journaled during the replay")); // NATS flapped
+        return true;
+    }
+
+    private async Task<bool> ReplayKeyAsync(string ik, DateTimeOffset firstOutageWrite, CancellationToken ct)
+    {
+        var head = await _l2.ReadAsync(ik, leader: true, ct).ConfigureAwait(false);
+        if (head is not { Op: L2Op.Put } || head.Created >= firstOutageWrite - OutageSkewMargin) return false;
+        var r = await _l2.DeleteAsync(ik, head.Revision, ct).ConfigureAwait(false);
+        if (r.Status == WriteStatus.Unknown) throw new L2UnavailableException($"Replay delete of '{ik}' has an unknown outcome.");
+        if (r.Status != WriteStatus.Committed) return false; // someone wrote meanwhile: theirs is newer than the outage write
+        _l1.Evict(ik, r.Seq, FloorTtl(_options.DefaultEntryOptions));
+        await PublishAsync(EventOp.Del, ik, r.Seq).ConfigureAwait(false);
+        return true;
     }
 
     // ------------------------------------------------------------------ provisioning
@@ -725,6 +1068,7 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
             {
                 await _provision(ct).ConfigureAwait(false);
                 _ready = true;
+                _listener?.Start();
                 _logger.LogInformation("NatsCache stores ready (prefix {Prefix})", _options.Prefix);
                 return;
             }
@@ -748,24 +1092,35 @@ public sealed class NatsCache : INatsCache, IAsyncDisposable, IDisposable
         }
     }
 
-    private static (IL2Store, IL2Store, Func<CancellationToken, ILogger, Task>) Build(NatsCacheOptions options, INatsConnection? connection, out INatsConnection? owned)
+    private sealed record NatsParts(IL2Store L2, IL2Store Locks, INotificationTransport Notify,
+        Func<CancellationToken, ILogger, Task> Provision, INatsConnection Connection);
+
+    private static NatsParts Build(NatsCacheOptions options, INatsConnection? connection, out INatsConnection? owned)
     {
         Provisioner.ValidateOptions(options);
         owned = null;
         if (connection is null)
         {
+            // Connection settings (design section 8).
             owned = connection = new NatsConnection(new NatsOpts
             {
                 Url = options.Url,
                 Name = $"NatsCache-{options.NodeId}",
                 MaxReconnectRetry = -1,
-                RequestTimeout = TimeSpan.FromSeconds(2), // design section 8; the unknown-outcome path depends on it
+                ReconnectWaitMin = TimeSpan.FromMilliseconds(100),
+                ReconnectWaitMax = TimeSpan.FromSeconds(2),
+                ReconnectJitter = TimeSpan.FromMilliseconds(100),
+                ConnectTimeout = TimeSpan.FromSeconds(2),
+                RequestTimeout = TimeSpan.FromSeconds(2), // the unknown-outcome path depends on it
+                PingInterval = TimeSpan.FromSeconds(10),
+                MaxPingOut = 2,
             });
         }
 
         var js = new NatsJSContext(connection);
         var names = new StoreNames(options.Prefix);
         var provisioner = new Provisioner(options);
-        return (new NatsL2Store(js, names.Cache), new NatsL2Store(js, names.Locks), (ct, logger) => provisioner.EnsureAsync(js, logger, ct));
+        return new NatsParts(new NatsL2Store(js, names.Cache), new NatsL2Store(js, names.Locks), new NatsNotificationTransport(js, names),
+            (ct, logger) => provisioner.EnsureAsync(js, logger, ct), connection);
     }
 }

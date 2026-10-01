@@ -8,6 +8,7 @@ public sealed class NatsCacheTests : IAsyncDisposable
     private readonly FakeTimeProvider _time = new(new DateTimeOffset(2026, 9, 30, 12, 0, 0, TimeSpan.Zero));
     private readonly FakeL2Store _l2;
     private readonly FakeL2Store _locks;
+    private readonly FakeNotificationTransport _notify = new();
     private readonly List<NatsCache> _caches = [];
 
     public NatsCacheTests()
@@ -20,7 +21,7 @@ public sealed class NatsCacheTests : IAsyncDisposable
     {
         var o = new NatsCacheOptions { Prefix = "test", NodeId = node, CompressionThresholdBytes = 1024 };
         configure?.Invoke(o);
-        var cache = new NatsCache(o, _l2, _locks, provision, null, _time, null, new FixedRandom(0.5));
+        var cache = new NatsCache(o, _l2, _locks, _notify, provision, null, _time, null, new FixedRandom(0.5));
         _caches.Add(cache);
         return cache;
     }

@@ -4,24 +4,22 @@ using Microsoft.Extensions.Caching.Memory;
 namespace NatsDistributedCache.Internal;
 
 /// <summary>
-/// One L1 entry: the deserialized value, its L2 revision, its jittered expiry and, when early refresh is on,
-/// the moment the value enters the last part of its L2 life (design section 6). A class, not a record: the
-/// refresh claim is mutable state that must not take part in equality.
+/// One L1 entry: its L2 revision, its jittered expiry and, when early refresh is on, the moment the value
+/// enters the last part of its L2 life (design section 6). The value lives in <see cref="L1Item{T}"/>, so a
+/// value type is stored unboxed. A class, not a record: the refresh claim is mutable state that must not take
+/// part in equality.
 /// </summary>
-internal sealed class L1Item
+internal abstract class L1Item
 {
     private int _refreshClaimed;
 
-    public L1Item(object? value, ulong revision, DateTimeOffset expiresAt, long size, DateTimeOffset? refreshAt = null)
+    protected L1Item(ulong revision, DateTimeOffset expiresAt, long size, DateTimeOffset? refreshAt)
     {
-        Value = value;
         Revision = revision;
         ExpiresAt = expiresAt;
         Size = size;
         RefreshAt = refreshAt;
     }
-
-    public object? Value { get; }
 
     public ulong Revision { get; }
 
@@ -33,6 +31,40 @@ internal sealed class L1Item
 
     /// <summary>True for the first caller only, so a hot key starts at most one early refresh per L1 fill.</summary>
     public bool TryClaimRefresh() => Interlocked.Exchange(ref _refreshClaimed, 1) == 0;
+
+    /// <summary>The value as <typeparamref name="TOut"/>: unboxed when the types match, else a type test.</summary>
+    public abstract bool TryGetValue<TOut>(out TOut value);
+}
+
+internal sealed class L1Item<T> : L1Item
+{
+    public L1Item(T value, ulong revision, DateTimeOffset expiresAt, long size, DateTimeOffset? refreshAt = null)
+        : base(revision, expiresAt, size, refreshAt) => Value = value;
+
+    public T Value { get; }
+
+    public override bool TryGetValue<TOut>(out TOut value)
+    {
+        if (this is L1Item<TOut> same)
+        {
+            value = same.Value;
+            return true;
+        }
+
+        // A reader with another T for the same key (e.g. object); boxes, but only on this rare path.
+        switch (Value)
+        {
+            case TOut cast:
+                value = cast;
+                return true;
+            case null when default(TOut) is null:
+                value = default!;
+                return true;
+            default:
+                value = default!;
+                return false;
+        }
+    }
 }
 
 /// <summary>
@@ -99,11 +131,36 @@ internal sealed class L1Store : IDisposable
                 Size = Math.Max(1, item.Size),
                 AbsoluteExpirationRelativeToNow = ttl,
             };
-            entry.RegisterPostEvictionCallback(static (k, _, _, state) => ((ConcurrentDictionary<string, byte>)state!).TryRemove((string)k, out _), _keys);
+            // A replaced entry fires the callback too; dropping the key then would hide the new entry from Clear().
+            entry.RegisterPostEvictionCallback(static (k, value, reason, state) =>
+            {
+                if (reason != EvictionReason.Replaced) ((ConcurrentDictionary<string, byte>)state!).TryRemove((string)k, out _);
+            }, _keys);
             _keys[key] = 0;
             _cache.Set(key, item, entry);
             return true;
         }
+    }
+
+    /// <summary>
+    /// A <c>set</c> event (design section 7, rules 3 and HWM): evict the local copy only if it is older than
+    /// <paramref name="revision"/>, and raise the key's high-water revision to it, so a lagging read of the old
+    /// value cannot refill L1.
+    /// </summary>
+    public void Invalidate(string key, ulong revision, TimeSpan floorTtl)
+    {
+        lock (Stripe(key))
+        {
+            if (_cache.TryGetValue(key, out var raw) && raw is L1Item existing && existing.Revision < revision) _cache.Remove(key);
+            SetFloor(key, revision, floorTtl);
+        }
+    }
+
+    /// <summary>Raises the key's high-water revision to a revision this node has served (I5: no revision regression).</summary>
+    public void RaiseFloor(string key, ulong revision, TimeSpan floorTtl)
+    {
+        if (revision == 0) return;
+        lock (Stripe(key)) SetFloor(key, revision, floorTtl);
     }
 
     /// <summary>Evicts the key and raises its floor to <paramref name="floorRevision"/> for <paramref name="floorTtl"/>.</summary>
@@ -112,9 +169,16 @@ internal sealed class L1Store : IDisposable
         lock (Stripe(key))
         {
             _cache.Remove(key);
-            if (floorRevision > 0 && floorTtl > TimeSpan.Zero && floorRevision > Floor(key))
-                _cache.Set(FloorPrefix + key, floorRevision, new MemoryCacheEntryOptions { Size = FloorSize, AbsoluteExpirationRelativeToNow = floorTtl });
+            SetFloor(key, floorRevision, floorTtl);
         }
+    }
+
+    private void SetFloor(string key, ulong revision, TimeSpan floorTtl)
+    {
+        if (revision == 0 || floorTtl <= TimeSpan.Zero) return;
+        var own = _cache.TryGetValue(FloorPrefix + key, out var raw) && raw is ulong f ? f : 0UL;
+        if (revision > own)
+            _cache.Set(FloorPrefix + key, revision, new MemoryCacheEntryOptions { Size = FloorSize, AbsoluteExpirationRelativeToNow = floorTtl });
     }
 
     /// <summary>Evicts every key under <paramref name="prefix"/> and holds a prefix floor (tag delete path).</summary>

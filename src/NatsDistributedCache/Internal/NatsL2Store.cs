@@ -96,6 +96,19 @@ internal sealed class NatsL2Store : IL2Store
             yield return k;
     }
 
+    public async ValueTask<ulong> LastSequenceAsync(CancellationToken ct)
+    {
+        try
+        {
+            var info = await _js.GetStreamAsync(_streamName, cancellationToken: ct).ConfigureAwait(false);
+            return info.Info.State.LastSeq;
+        }
+        catch (Exception ex) when (IsTransport(ex) || ex is NatsJSApiException)
+        {
+            throw new L2UnavailableException($"StreamInfo of '{_streamName}' failed.", ex);
+        }
+    }
+
     private async ValueTask<WriteResult> PublishAsync(string key, byte[] data, NatsHeaders h, ulong? expected, CancellationToken ct)
     {
         // One msg id per logical write; reused only for resends of this same write (design section 3).
